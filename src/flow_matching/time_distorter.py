@@ -32,11 +32,16 @@ class TimeDistorter:
         sigma=1,
         alpha=1,
         beta=1,
+        distortion_a=1.0,
+        distortion_b=1.0,
     ):
         self.train_distortion = train_distortion  # used for sample_ft
         self.sample_distortion = sample_distortion  # used for get_ft
         self.alpha = alpha
         self.beta = beta
+        # Kumaraswamy(a, b) parameters of the 'continuous' distortion
+        self.distortion_a = distortion_a
+        self.distortion_b = distortion_b
         print(
             f"TimeDistorter: train_distortion={train_distortion}, sample_distortion={sample_distortion}"
         )
@@ -125,6 +130,8 @@ class TimeDistorter:
             ft = t**2
         elif distortion_type == "polydec":
             ft = 2 * t - t**2
+        elif distortion_type == "continuous": # Kumaraswamy CDF
+            ft = 1 - (1 - t**self.distortion_a) ** self.distortion_b
         elif distortion_type == "beta":
             raise ValueError(f"Unsupported for now: {distortion_type}")
         elif distortion_type == "logitnormal":

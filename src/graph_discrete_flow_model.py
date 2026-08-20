@@ -127,6 +127,8 @@ class GraphDiscreteFlowModel(pl.LightningModule):
             sample_distortion=cfg.sample.time_distortion,
             alpha=1,
             beta=1,
+            distortion_a=cfg.sample.distortion_a,
+            distortion_b=cfg.sample.distortion_b,
         )
 
         # rate matrix designer
