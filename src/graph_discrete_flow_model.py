@@ -1,6 +1,8 @@
 import time
 import wandb
 import os
+import random
+import itertools
 
 import numpy as np
 import pickle
@@ -956,6 +958,38 @@ class GraphDiscreteFlowModel(pl.LightningModule):
         results_df.to_csv(tmp_path)
         os.replace(tmp_path, csv_path)  # never leave a half-written checkpoint
 
+    def _apply_sampling_config(self, num_step=None, distortor=None, eta=None, omega=None):
+        if num_step is not None:
+            self.cfg.sample.sample_steps = num_step
+        if distortor is not None:
+            self.cfg.sample.time_distortion = distortor
+        if eta is not None:
+            self.cfg.sample.eta = self.rate_matrix_designer.eta = eta
+        if omega is not None:
+            self.cfg.sample.omega = self.rate_matrix_designer.omega = omega
+
+    def _reset_sampling_config(self):
+        self._apply_sampling_config(distortor="identity", eta=0.0, omega=0.0)
+
+    def _print_progress(self, config_time, done, total, search_start):
+        elapsed = time.time() - search_start
+        remaining = elapsed / done * (total - done)
+        print(
+            f"  -> took {config_time:.2f}s | elapsed: {elapsed:.2f}s "
+            f"({elapsed / 60:.2f} min) | ETA remaining: {remaining:.2f}s "
+            f"({remaining / 60:.2f} min)"
+        )
+
+    def _omega_power_transform(self, omega_linear):
+        """omega = lo + (hi-lo)*(1-u**root); root < 1 concentrates the draws near lo."""
+        omega_low, omega_high = self.cfg.sample.search_omega_range
+        span = omega_high - omega_low
+        # root == 1 degenerates to the mirror u -> 1-u, so pass the draw through
+        if span == 0 or self.cfg.sample.search_random_omega_root == 1.0:
+            return omega_linear
+        u = (omega_linear - omega_low) / span
+        return omega_low + (1.0 - u ** self.cfg.sample.search_random_omega_root) * span
+
     def _write_search_summary(self, search_times=None):
         with open("search_summary.txt", "w") as f:
             f.write(f"search: {self.cfg.sample.search}\n")
@@ -985,9 +1019,11 @@ class GraphDiscreteFlowModel(pl.LightningModule):
             "distortion": self.search_distortion,
             "stochasticity": self.search_stochasticity,
             "target_guidance": self.search_target_guidance,
+            "full_grid": self.search_full_grid,
+            "random": self.search_random,
         }
         if self.cfg.sample.search == "all":
-            to_run = list(searches)
+            to_run = ["distortion", "stochasticity", "target_guidance"]
         elif self.cfg.sample.search in searches:
             to_run = [self.cfg.sample.search]
         else:
@@ -1112,3 +1148,94 @@ class GraphDiscreteFlowModel(pl.LightningModule):
         results_df.reset_index(inplace=True)
         results_df.set_index(["num_step", "omega"], inplace=True)
         results_df.to_csv(f"search_target_guidance.csv")
+
+    def search_full_grid(self, num_step_list):
+        """
+        Grid search over distortion x eta x omega, checkpointed after every config.
+        """
+        distortion_list = ["identity", "polydec", "cos", "revcos", "polyinc"]
+        eta_list = [0.0, 5, 10, 25, 50, 100]
+        omega_list = [0.0, 0.01, 0.02, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5]
+
+        version_dir = self._search_version_dir("full_grid", tags=(self.cfg.dataset.name,))
+        checkpoint_path = os.path.join(version_dir, "results.csv")
+        key_cols = ["num_step", "distortor", "eta", "omega"]
+        dtypes = {"num_step": int, "distortor": str, "eta": float, "omega": float}
+        results_df, completed = self._load_search_checkpoint(checkpoint_path, key_cols, dtypes)
+
+        grid = itertools.product(num_step_list, distortion_list, eta_list, omega_list)
+        todo = [c for c in grid if (int(c[0]), str(c[1]), float(c[2]), float(c[3])) not in completed]
+
+        search_start = time.time()
+        for run_idx, (num_step, distortor, eta, omega) in enumerate(todo, 1):
+            self._apply_sampling_config(num_step, distortor, eta, omega)
+            print(
+                f"############# [{run_idx}/{len(todo)}] Testing num steps: {num_step}, "
+                f"distortor: {distortor}, eta: {eta}, omega: {omega} #############"
+            )
+            samples, labels, res, config_time = self._sample_and_evaluate()
+            self._print_progress(config_time, run_idx, len(todo), search_start)
+            res_df = self._result_row(res, num_step=num_step, distortor=distortor, eta=eta, omega=omega, time_s=config_time)
+            results_df = pd.concat([results_df, res_df], ignore_index=True)
+            self._save_search_checkpoint(results_df, checkpoint_path)
+
+        self._reset_sampling_config()
+
+        results_df.reset_index(inplace=True)
+        results_df.set_index(key_cols, inplace=True)
+        self._save_search_checkpoint(results_df, checkpoint_path)
+        self._mark_search_done(version_dir)
+        print(f"search_full_grid results checkpointed at {checkpoint_path}")
+
+    def search_random(self, num_step_list):
+        """
+        Random search over distortion x eta x omega, checkpointed after every trial.
+        """
+        distortion_list = ["identity", "polydec", "cos", "revcos", "polyinc"]
+        eta_low, eta_high = self.cfg.sample.search_eta_range
+        omega_low, omega_high = self.cfg.sample.search_omega_range
+        n_trials = self.cfg.sample.search_n_trials
+
+        version_dir = self._search_version_dir(
+            "random", tags=(self.cfg.dataset.name, f"seed{self.cfg.sample.search_seed}")
+        )
+        checkpoint_path = os.path.join(version_dir, "results.csv")
+        results_df, completed = self._load_search_checkpoint(
+            checkpoint_path, ["num_step", "trial_idx"], {"num_step": int, "trial_idx": int}
+        )
+
+        rng = random.Random(self.cfg.sample.search_seed)
+        n_total = len(num_step_list) * n_trials
+        n_todo = n_total - len(completed)
+
+        search_start = time.time()
+        executed = 0
+        for num_step, trial_idx in itertools.product(num_step_list, range(n_trials)):
+            # drawn for every trial, completed or not, to keep the RNG stream aligned
+            distortor = rng.choice(distortion_list)
+            eta = rng.uniform(eta_low, eta_high)
+            omega_raw = rng.uniform(omega_low, omega_high)
+            omega = self._omega_power_transform(omega_raw)
+            if (int(num_step), int(trial_idx)) in completed:
+                continue
+
+            executed += 1
+            self._apply_sampling_config(num_step, distortor, eta, omega)
+            print(
+                f"############# [{executed}/{n_todo}] Random trial: num_steps: {num_step}, "
+                f"distortor: {distortor}, eta: {eta:.4f}, omega: {omega:.4f} #############"
+            )
+            samples, labels, res, config_time = self._sample_and_evaluate()
+            self._print_progress(config_time, executed, n_todo, search_start)
+            # omega is what was sampled with, omega_raw the draw before the power transform
+            res_df = self._result_row(res, num_step=num_step, distortor=distortor, eta=eta, omega=omega, omega_raw=omega_raw, trial_idx=trial_idx, time_s=config_time)
+            results_df = pd.concat([results_df, res_df], ignore_index=True)
+            self._save_search_checkpoint(results_df, checkpoint_path)
+
+        self._reset_sampling_config()
+
+        results_df.reset_index(inplace=True)
+        results_df.set_index(["num_step", "distortor", "eta", "omega"], inplace=True)
+        self._save_search_checkpoint(results_df, checkpoint_path)
+        self._mark_search_done(version_dir)
+        print(f"search_random results checkpointed at {checkpoint_path}")

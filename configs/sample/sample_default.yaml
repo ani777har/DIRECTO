@@ -9,7 +9,14 @@ time_distortion: "identity"     # 'uniform', 'cosine', polyinc, polydec, continu
 # 'continuous' time distortion: Kumaraswamy(a, b), f(t)=1-(1-t^a)^b.
 distortion_a: 1.0
 distortion_b: 1.0
-search: False           # 'all' | 'target_guidance' | 'distortion' | 'stochasticity' | False
+search: False           # 'all' | 'target_guidance' | 'distortion' | 'stochasticity' | 'full_grid' | 'random' | False
+
+# shared across the searches that sample configs rather than enumerate them
+search_n_trials: 25             # trials per num_step
+search_seed: 0
+search_eta_range: [0.0, 200.0]
+search_omega_range: [0.0, 2.0]
+search_random_omega_root: 1.0   # omega = lo + (hi-lo)*(1 - u**root); <1 concentrates draws near lo, 1.0 = uniform
 
 # fixed
 rdb: 'general'            # general | column | entry
