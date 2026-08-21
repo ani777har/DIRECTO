@@ -12,6 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
 from torch.distributions.categorical import Categorical
+from hydra.utils import get_original_cwd
 
 from models.transformer_model import GraphTransformer
 from models.transformer_model_directed import GraphTransformerDirected
@@ -842,6 +843,131 @@ class GraphDiscreteFlowModel(pl.LightningModule):
 
         return utils.PlaceHolder(X=extra_X, E=extra_E, y=extra_y)
 
+    def _sample_and_evaluate(self):
+        """Generate and evaluate one sampling configuration.
+
+        Returns (samples, labels, res, total_time); the timings are also added to
+        `res` as (mean, std) pairs so the searches pick them up as CSV columns.
+        """
+        t0 = time.time()
+        samples, labels = self.sample(
+            is_test=True,
+            save_samples=self.cfg.general.save_samples,
+            save_visualization=False,
+        )
+        sample_time = time.time() - t0
+
+        t1 = time.time()
+        res = self.evaluate_samples(samples=samples, labels=labels, is_test=True)
+        eval_time = time.time() - t1
+
+        res["sampling_time_s"] = (sample_time, 0.0)
+        res["eval_time_s"] = (eval_time, 0.0)
+        print(
+            f"  -> generation {sample_time:.2f}s | evaluation {eval_time:.2f}s "
+            f"(eval/gen = {eval_time / max(sample_time, 1e-9):.2f})"
+        )
+        return samples, labels, res, sample_time + eval_time
+
+    @staticmethod
+    def _result_row(res, **cols):
+        row = {f"{key}_mean": value[0] for key, value in res.items()}
+        row.update({f"{key}_std": value[1] for key, value in res.items()})
+        row.update(cols)
+        return pd.DataFrame([row])
+
+    @staticmethod
+    def _slugify(value):
+        text = str(value).strip().lower()
+        return "".join(c if (c.isalnum() or c in "-_.") else "-" for c in text)
+
+    def _search_version_dir(self, search_name, tags=()):
+        """Claim outputs/<search>_<tags>/version_N, resuming the latest unfinished one."""
+        parts = [search_name] + [
+            self._slugify(t) for t in tags if t is not None and str(t) != ""
+        ]
+        base_dir = os.path.abspath(
+            os.path.join(get_original_cwd(), "..", "outputs", "_".join(parts))
+        )
+        os.makedirs(base_dir, exist_ok=True)
+
+        for _ in range(100):
+            versions = sorted(
+                int(d.split("_")[1])
+                for d in os.listdir(base_dir)
+                if d.startswith("version_") and d.split("_")[1].isdigit()
+            )
+            if versions:
+                latest_dir = os.path.join(base_dir, f"version_{versions[-1]}")
+                if not os.path.exists(os.path.join(latest_dir, "DONE")):
+                    print(f"Resuming search in {latest_dir}")
+                    self._record_hydra_run(latest_dir)
+                    return latest_dir
+                next_version = versions[-1] + 1
+            else:
+                next_version = 0
+
+            new_dir = os.path.join(base_dir, f"version_{next_version}")
+            try:
+                # atomic, so two jobs starting together cannot claim one version
+                os.mkdir(new_dir)
+            except FileExistsError:
+                continue
+            print(f"Starting search in {new_dir}")
+            self._record_hydra_run(new_dir)
+            return new_dir
+
+        raise RuntimeError(
+            f"Could not claim a version directory under {base_dir} after 100 "
+            f"attempts -- too many jobs starting at once?"
+        )
+
+    def _record_hydra_run(self, version_dir):
+        try:
+            from hydra.core.hydra_config import HydraConfig
+
+            run_dir = os.path.abspath(HydraConfig.get().runtime.output_dir)
+        except Exception:
+            run_dir = os.getcwd()  # not in a Hydra context (e.g. a unit test)
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S %Z")
+        with open(os.path.join(version_dir, "hydra_runs.txt"), "a") as f:
+            f.write(f"{stamp}\t{run_dir}\n")
+
+    def _mark_search_done(self, version_dir):
+        open(os.path.join(version_dir, "DONE"), "w").close()
+
+    def _load_search_checkpoint(self, csv_path, key_cols, dtypes):
+        """Previously completed rows, plus the set of config tuples to skip."""
+        if not os.path.exists(csv_path):
+            return pd.DataFrame(), set()
+        existing = pd.read_csv(csv_path)
+        existing = existing.loc[:, ~existing.columns.str.match(r"^Unnamed")]
+        for col, caster in dtypes.items():
+            existing[col] = existing[col].apply(caster)
+        completed = set(existing[key_cols].apply(tuple, axis=1))
+        print(
+            f"Resuming from checkpoint {csv_path}: "
+            f"{len(completed)} combo(s) already completed."
+        )
+        return existing, completed
+
+    def _save_search_checkpoint(self, results_df, csv_path):
+        tmp_path = f"{csv_path}.tmp"
+        results_df.to_csv(tmp_path)
+        os.replace(tmp_path, csv_path)  # never leave a half-written checkpoint
+
+    def _write_search_summary(self, search_times=None):
+        with open("search_summary.txt", "w") as f:
+            f.write(f"search: {self.cfg.sample.search}\n")
+            f.write(f"status: {'completed' if search_times else 'running'}\n")
+            f.write(f"started: {self._search_started_at}\n")
+            for line in self._search_summary_info:
+                f.write(f"{line}\n")
+            if search_times:
+                f.write("\nTime this run:\n")
+                for name, t in search_times.items():
+                    f.write(f"{name}: {t:.2f}s ({t / 60:.2f} min)\n")
+
     def search_hyperparameters(self):
         """
         Grid search for sampling hypeparameters.
@@ -849,28 +975,39 @@ class GraphDiscreteFlowModel(pl.LightningModule):
         """
 
         num_step_list = [100] #[50, 1000]  # [5, 10, 50, 100, 1000]
- 
+
         if self.cfg.dataset.name == "qm9":
             num_step_list = [1, 5, 10, 50, 100, 500]
-        if self.cfg.dataset.name in ["guacamol", 'moses']:  # accelerate 
+        if self.cfg.dataset.name in ["guacamol", 'moses']:  # accelerate
             num_step_list = [50]
 
+        searches = {
+            "distortion": self.search_distortion,
+            "stochasticity": self.search_stochasticity,
+            "target_guidance": self.search_target_guidance,
+        }
         if self.cfg.sample.search == "all":
-            results_df = self.search_distortion(num_step_list)
-            results_df = self.search_stochasticity(num_step_list)
-            results_df = self.search_target_guidance(num_step_list)
-        elif self.cfg.sample.search == "distortion":
-            results_df = self.search_distortion(num_step_list)
-        elif self.cfg.sample.search == "stochasticity":
-            results_df = self.search_stochasticity(num_step_list)
-        elif self.cfg.sample.search == "target_guidance":
-            results_df = self.search_target_guidance(num_step_list)
+            to_run = list(searches)
+        elif self.cfg.sample.search in searches:
+            to_run = [self.cfg.sample.search]
         else:
             raise NotImplementedError(
                 f"Search type {self.cfg.sample.search} not implemented."
             )
 
-        print("Finished searching. Results saved to search_hyperparameters.csv")
+        self._search_started_at = time.strftime("%Y-%m-%d %H:%M:%S %Z")
+        self._search_summary_info = []
+        self._write_search_summary()
+
+        search_times = {}
+        for name in to_run:
+            t0 = time.time()
+            searches[name](num_step_list)
+            search_times[name] = time.time() - t0
+        search_times["total"] = sum(search_times.values())
+        self._write_search_summary(search_times)
+
+        print("Finished searching. Timings in search_summary.txt")
 
     def search_distortion(self, num_step_list):
         """
@@ -887,20 +1024,8 @@ class GraphDiscreteFlowModel(pl.LightningModule):
                 print(
                     f"############# Testing num steps: {num_step}, distortor: {distortor} #############"
                 )
-                samples, labels = self.sample(
-                    is_test=True,
-                    save_samples=self.cfg.general.save_samples,
-                    save_visualization=False,
-                )
-                res = self.evaluate_samples(
-                    samples=samples, labels=labels, is_test=True
-                )
-                mean_res = {f"{key}_mean": res[key][0] for key in res}
-                std_res = {f"{key}_std": res[key][1] for key in res}
-                mean_res.update(std_res)
-                res_df = pd.DataFrame([mean_res])
-                res_df["num_step"] = num_step
-                res_df["distortor"] = distortor
+                samples, labels, res, config_time = self._sample_and_evaluate()
+                res_df = self._result_row(res, num_step=num_step, distortor=distortor, time_s=config_time)
                 results_df = pd.concat([results_df, res_df], ignore_index=True)
                 # save at each step as well
                 results_df.to_csv(f"search_distortion.csv")
@@ -929,26 +1054,15 @@ class GraphDiscreteFlowModel(pl.LightningModule):
                 print(
                     f"############# Testing num steps: {num_step}, eta: {eta} #############"
                 )
-                samples, labels = self.sample(
-                    is_test=True,
-                    save_samples=self.cfg.general.save_samples,
-                    save_visualization=False,
-                )
-                res = self.evaluate_samples(
-                    samples=samples, labels=labels, is_test=True
-                )
-                mean_res = {f"{key}_mean": res[key][0] for key in res}
-                std_res = {f"{key}_std": res[key][1] for key in res}
-                mean_res.update(std_res)
-                res_df = pd.DataFrame([mean_res])
-                res_df["num_step"] = num_step
-                res_df["eta"] = eta
+                samples, labels, res, config_time = self._sample_and_evaluate()
+                res_df = self._result_row(res, num_step=num_step, eta=eta, time_s=config_time)
                 results_df = pd.concat([results_df, res_df], ignore_index=True)
                 # save at each step as well
                 results_df.to_csv(f"search_stochasticity.csv")
 
         # set back to default value
         self.cfg.sample.eta = 0.0
+        self.rate_matrix_designer.eta = 0.0
 
         # save the final results
         results_df.reset_index(inplace=True)
@@ -984,26 +1098,15 @@ class GraphDiscreteFlowModel(pl.LightningModule):
                 print(
                     f"############# Testing num steps: {num_step}, omega: {omega} #############"
                 )
-                samples, labels = self.sample(
-                    is_test=True,
-                    save_samples=self.cfg.general.save_samples,
-                    save_visualization=False,
-                )
-                res = self.evaluate_samples(
-                    samples=samples, labels=labels, is_test=True
-                )
-                mean_res = {f"{key}_mean": res[key][0] for key in res}
-                std_res = {f"{key}_std": res[key][1] for key in res}
-                mean_res.update(std_res)
-                res_df = pd.DataFrame([mean_res])
-                res_df["num_step"] = num_step
-                res_df["omega"] = omega
+                samples, labels, res, config_time = self._sample_and_evaluate()
+                res_df = self._result_row(res, num_step=num_step, omega=omega, time_s=config_time)
                 results_df = pd.concat([results_df, res_df], ignore_index=True)
                 # save at each step as well
                 results_df.to_csv(f"search_target_guidance.csv")
 
         # set back to default value
         self.cfg.sample.omega = 0.0
+        self.rate_matrix_designer.omega = 0.0
 
         # save the final results
         results_df.reset_index(inplace=True)
