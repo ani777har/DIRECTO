@@ -990,6 +990,24 @@ class GraphDiscreteFlowModel(pl.LightningModule):
         u = (omega_linear - omega_low) / span
         return omega_low + (1.0 - u ** self.cfg.sample.search_random_omega_root) * span
 
+    def _save_optuna_visualizations(self, study, num_step, sampler_name):
+        from optuna import visualization as viz
+
+        if not viz.is_available():
+            print("  [viz] plotly not installed; skipping Optuna plots")
+            return
+        tag = f"{sampler_name}_numstep{num_step}"
+        for name, build in (
+            ("optimization_history", viz.plot_optimization_history),
+            ("slice", viz.plot_slice),
+            ("param_importances", viz.plot_param_importances),
+        ):
+            try:
+                build(study).write_html(f"optuna_{tag}_{name}.html")
+            except Exception as e:
+                print(f"  [viz] skip {name} for {tag}: {e}")
+        print(f"  [viz] Optuna plots saved for {tag} (optuna_{tag}_*.html)")
+
     def _write_search_summary(self, search_times=None):
         with open("search_summary.txt", "w") as f:
             f.write(f"search: {self.cfg.sample.search}\n")
@@ -1021,6 +1039,7 @@ class GraphDiscreteFlowModel(pl.LightningModule):
             "target_guidance": self.search_target_guidance,
             "full_grid": self.search_full_grid,
             "random": self.search_random,
+            "sobol": self.search_sobol,
         }
         if self.cfg.sample.search == "all":
             to_run = ["distortion", "stochasticity", "target_guidance"]
@@ -1239,3 +1258,103 @@ class GraphDiscreteFlowModel(pl.LightningModule):
         self._save_search_checkpoint(results_df, checkpoint_path)
         self._mark_search_done(version_dir)
         print(f"search_random results checkpointed at {checkpoint_path}")
+
+    def search_sobol(self, num_step_list):
+        """
+        Sobol (scrambled QMC) search over distortion x eta x omega.
+
+        The study lives in a sqlite file inside the version directory, so an
+        interrupted run picks the sequence up exactly where it stopped.
+        """
+        import optuna
+
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+        distortion_list = ["identity", "polydec", "cos", "revcos", "polyinc"]
+        eta_low, eta_high = self.cfg.sample.search_eta_range
+        omega_low, omega_high = self.cfg.sample.search_omega_range
+        n_trials = self.cfg.sample.search_n_trials
+        objective_col = self.cfg.sample.search_objective
+        search_space = {
+            "eta": optuna.distributions.FloatDistribution(eta_low, eta_high),
+            "omega": optuna.distributions.FloatDistribution(omega_low, omega_high),
+            "distortion_u": optuna.distributions.FloatDistribution(0, len(distortion_list)),
+        }
+
+        version_dir = self._search_version_dir(
+            "sobol", tags=(self.cfg.dataset.name, f"seed{self.cfg.sample.search_seed}")
+        )
+        checkpoint_path = os.path.join(version_dir, "results.csv")
+        storage = f"sqlite:///{os.path.join(version_dir, 'study.db')}"
+        results_df, completed = self._load_search_checkpoint(
+            checkpoint_path, ["num_step", "trial_idx"], {"num_step": int, "trial_idx": int}
+        )
+
+        n_todo = len(num_step_list) * n_trials - len(completed)
+        search_start = time.time()
+        executed = 0
+        for num_step in num_step_list:
+            study = optuna.create_study(
+                direction="minimize",
+                study_name=f"numstep{num_step}",
+                storage=storage,
+                load_if_exists=True,
+                sampler=optuna.samplers.QMCSampler(
+                    qmc_type="sobol", scramble=True, seed=self.cfg.sample.search_seed
+                ),
+            )
+            if not study.trials:
+                # the first ask has no completed trial to infer the space from and
+                # falls back to independent sampling, so burn it
+                study.tell(study.ask(search_space), state=optuna.trial.TrialState.PRUNED)
+            # a trial asked but never told -- the job was killed mid-evaluation -- still
+            # owns its point of the sequence, so re-run it rather than leave a gap
+            pending = list(study.get_trials(deepcopy=False, states=(optuna.trial.TrialState.RUNNING,)))
+            done_states = (optuna.trial.TrialState.COMPLETE, optuna.trial.TrialState.FAIL)
+            if len(study.get_trials(deepcopy=False, states=done_states)):
+                print(f"Resuming the sobol sequence for num_step={num_step}.")
+
+            while len(study.get_trials(deepcopy=False, states=done_states)) < n_trials:
+                trial = pending.pop(0) if pending else study.ask(search_space)
+                trial_idx = trial.number - 1  # the warmup trial took number 0
+                eta = float(trial.params["eta"])
+                omega_raw = float(trial.params["omega"])
+                omega = self._omega_power_transform(omega_raw)
+                distortor = distortion_list[
+                    min(int(trial.params["distortion_u"]), len(distortion_list) - 1)
+                ]
+
+                executed += 1
+                self._apply_sampling_config(num_step, distortor, eta, omega)
+                print(
+                    f"############# [{executed}/{n_todo}] Sobol trial: num_steps: {num_step}, "
+                    f"distortor: {distortor}, eta: {eta:.4f}, omega: {omega:.4f} #############"
+                )
+                samples, labels, res, config_time = self._sample_and_evaluate()
+                self._print_progress(config_time, executed, n_todo, search_start)
+                # omega is what was sampled with, omega_raw the draw before the power transform
+                res_df = self._result_row(res, num_step=num_step, distortor=distortor, eta=eta, omega=omega, omega_raw=omega_raw, distortion_u=trial.params["distortion_u"], trial_idx=trial_idx, time_s=config_time)
+                if objective_col not in res_df:
+                    raise KeyError(
+                        f"sample.search_objective '{objective_col}' is not among the "
+                        f"evaluated metrics: {sorted(res_df.columns)}"
+                    )
+
+                value = float(res_df[objective_col].iloc[0])
+                if np.isfinite(value):
+                    study.tell(trial.number, value)
+                else:
+                    study.tell(trial.number, state=optuna.trial.TrialState.FAIL)
+                results_df = pd.concat([results_df, res_df], ignore_index=True)
+                self._save_search_checkpoint(results_df, checkpoint_path)
+
+            if self.cfg.sample.search_visualize:
+                self._save_optuna_visualizations(study, num_step, "sobol")
+
+        self._reset_sampling_config()
+
+        results_df.reset_index(inplace=True)
+        results_df.set_index(["num_step", "distortor", "eta", "omega"], inplace=True)
+        self._save_search_checkpoint(results_df, checkpoint_path)
+        self._mark_search_done(version_dir)
+        print(f"search_sobol results checkpointed at {checkpoint_path}")
