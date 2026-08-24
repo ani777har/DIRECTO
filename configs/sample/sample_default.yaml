@@ -9,7 +9,7 @@ time_distortion: "identity"     # 'uniform', 'cosine', polyinc, polydec, continu
 # 'continuous' time distortion: Kumaraswamy(a, b), f(t)=1-(1-t^a)^b.
 distortion_a: 1.0
 distortion_b: 1.0
-search: False           # 'all' | 'target_guidance' | 'distortion' | 'stochasticity' | 'full_grid' | 'random' | 'sobol' | False
+search: False           # 'all' | 'target_guidance' | 'distortion' | 'stochasticity' | 'full_grid' | 'random' | 'sobol' | 'bo' | False
 
 # shared across the searches that sample configs rather than enumerate them
 search_n_trials: 25             # trials per num_step
@@ -17,8 +17,16 @@ search_seed: 0
 search_eta_range: [0.0, 200.0]
 search_omega_range: [0.0, 2.0]
 search_random_omega_root: 1.0   # omega = lo + (hi-lo)*(1 - u**root); <1 concentrates draws near lo, 1.0 = uniform
-search_objective: ratio/average_ratio_mean  # results column the samplers minimize
-search_visualize: True          # Optuna's html plots (needs plotly)
+search_objective: ratio     # 'ratio' (minimize ratio/average_ratio) | 'vun' (maximize
+                            # frac_unic_non_iso_valid) | 'both' (multi-objective Pareto)
+search_visualize: True          
+
+# 'bo' search
+search_bo_sampler: tpe          # 'tpe' | 'gp'
+search_bo_n_startup_trials: 5   # random trials before the model takes over
+search_bo_distortion_mode: continuous  # 'continuous' (Kumaraswamy a/b) | 'categorical' (the 5 named curves)
+search_distortion_a_range: [0.2, 5.0]  # Kumaraswamy a; a=b=1 (identity) sits inside this range
+search_distortion_b_range: [0.2, 5.0]  # Kumaraswamy b
 
 # fixed
 rdb: 'general'            # general | column | entry

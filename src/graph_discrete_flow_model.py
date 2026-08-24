@@ -28,6 +28,22 @@ from flow_matching.utils import p_xt_g_x1
 from flow_matching import flow_matching_utils
 
 
+def objective_spec(objective, directed):
+    """(result columns, optuna directions) for a sample.search_objective."""
+    ratio = "ratio/average_ratio_mean"
+    # the directed metrics prefix every key with the split, the undirected ones
+    # hardcode 'sampling'; the searches always evaluate with test=True
+    vun = ("test/" if directed else "sampling/") + "frac_unic_non_iso_valid_mean"
+    specs = {
+        "ratio": ([ratio], ["minimize"]),
+        "vun": ([vun], ["maximize"]),
+        "both": ([ratio, vun], ["minimize", "maximize"]),
+    }
+    if objective not in specs:
+        raise ValueError(f"Unknown search_objective '{objective}'. Choose from {list(specs)}.")
+    return specs[objective]
+
+
 class GraphDiscreteFlowModel(pl.LightningModule):
     def __init__(
         self,
@@ -846,11 +862,7 @@ class GraphDiscreteFlowModel(pl.LightningModule):
         return utils.PlaceHolder(X=extra_X, E=extra_E, y=extra_y)
 
     def _sample_and_evaluate(self):
-        """Generate and evaluate one sampling configuration.
-
-        Returns (samples, labels, res, total_time); the timings are also added to
-        `res` as (mean, std) pairs so the searches pick them up as CSV columns.
-        """
+        """Generate and evaluate one sampling configuration. Returns (samples, labels, res, total_time)"""
         t0 = time.time()
         samples, labels = self.sample(
             is_test=True,
@@ -911,7 +923,6 @@ class GraphDiscreteFlowModel(pl.LightningModule):
 
             new_dir = os.path.join(base_dir, f"version_{next_version}")
             try:
-                # atomic, so two jobs starting together cannot claim one version
                 os.mkdir(new_dir)
             except FileExistsError:
                 continue
@@ -942,8 +953,8 @@ class GraphDiscreteFlowModel(pl.LightningModule):
         """Previously completed rows, plus the set of config tuples to skip."""
         if not os.path.exists(csv_path):
             return pd.DataFrame(), set()
-        existing = pd.read_csv(csv_path)
-        existing = existing.loc[:, ~existing.columns.str.match(r"^Unnamed")]
+        existing = pd.read_csv(csv_path, float_precision="round_trip")
+        existing = existing.loc[:, ~existing.columns.str.match(r"^(Unnamed|index$|level_\d+$)")]
         for col, caster in dtypes.items():
             existing[col] = existing[col].apply(caster)
         completed = set(existing[key_cols].apply(tuple, axis=1))
@@ -958,7 +969,7 @@ class GraphDiscreteFlowModel(pl.LightningModule):
         results_df.to_csv(tmp_path)
         os.replace(tmp_path, csv_path)  # never leave a half-written checkpoint
 
-    def _apply_sampling_config(self, num_step=None, distortor=None, eta=None, omega=None):
+    def _apply_sampling_config(self, num_step=None, distortor=None, eta=None, omega=None, a=None, b=None):
         if num_step is not None:
             self.cfg.sample.sample_steps = num_step
         if distortor is not None:
@@ -967,13 +978,17 @@ class GraphDiscreteFlowModel(pl.LightningModule):
             self.cfg.sample.eta = self.rate_matrix_designer.eta = eta
         if omega is not None:
             self.cfg.sample.omega = self.rate_matrix_designer.omega = omega
+        if a is not None:
+            self.cfg.sample.distortion_a = self.time_distorter.distortion_a = a
+        if b is not None:
+            self.cfg.sample.distortion_b = self.time_distorter.distortion_b = b
 
     def _reset_sampling_config(self):
-        self._apply_sampling_config(distortor="identity", eta=0.0, omega=0.0)
+        self._apply_sampling_config(distortor="identity", eta=0.0, omega=0.0, a=1.0, b=1.0)
 
     def _print_progress(self, config_time, done, total, search_start):
         elapsed = time.time() - search_start
-        remaining = elapsed / done * (total - done)
+        remaining = elapsed / done * max(total - done, 0)
         print(
             f"  -> took {config_time:.2f}s | elapsed: {elapsed:.2f}s "
             f"({elapsed / 60:.2f} min) | ETA remaining: {remaining:.2f}s "
@@ -990,6 +1005,95 @@ class GraphDiscreteFlowModel(pl.LightningModule):
         u = (omega_linear - omega_low) / span
         return omega_low + (1.0 - u ** self.cfg.sample.search_random_omega_root) * span
 
+    def _ask(self, study, search_space):
+        # GPSampler optimizes its acquisition function with autograd, which the
+        # inference_mode trainer.test() runs under would otherwise block
+        with torch.inference_mode(False), torch.enable_grad():
+            return study.ask(search_space)
+
+    def _replay_trials(self, study, results_df, num_step, search_space, param_cols, objective_cols, label):
+        """Re-ask every recorded trial and tell it its recorded value."""
+        import optuna
+
+        if not len(results_df):
+            return 0
+        prior = results_df[results_df["num_step"] == num_step].sort_values("trial_idx")
+
+        for replay_idx, (_, row) in enumerate(prior.iterrows()):
+            trial = self._ask(study, search_space)
+            mismatched = [
+                f"{param}: recorded {row[col]!r}, replayed {trial.params[param]!r}"
+                for param, col in param_cols.items()
+                if not (
+                    np.isclose(float(trial.params[param]), float(row[col]), rtol=1e-9, atol=1e-12)
+                    if isinstance(trial.params[param], float)
+                    else str(trial.params[param]) == str(row[col])
+                )
+            ]
+            if mismatched:
+                raise RuntimeError(
+                    f"{label} resume: replayed trial {replay_idx} (num_step={num_step}) did not "
+                    f"reproduce the recorded proposal -- " + "; ".join(mismatched) + ".\n"
+                    f"The sampler state could not be reconstructed, so this would NOT continue "
+                    f"the original search. Check that search_seed, search_eta_range, "
+                    f"search_omega_range, the sampler settings and the optuna version all match "
+                    f"the run being resumed."
+                )
+            values = [float(row[col]) for col in objective_cols]
+            if all(np.isfinite(v) for v in values):
+                study.tell(trial, values[0] if len(values) == 1 else values)
+            else:
+                study.tell(trial, state=optuna.trial.TrialState.FAIL)
+
+        if len(prior):
+            print(
+                f"Replayed {len(prior)} trial(s) for num_step={num_step} into the {label} "
+                f"study: every proposal was regenerated and verified, so the sampler state is "
+                f"exactly reconstructed and no model inference was re-run."
+            )
+        return len(prior)
+
+    def _make_bo_sampler(self, sampler_name, n_startup_trials):
+        import optuna
+
+        seed = self.cfg.sample.search_seed
+        if sampler_name == "tpe":
+            return optuna.samplers.TPESampler(seed=seed, n_startup_trials=n_startup_trials)
+        if sampler_name == "gp":
+            return optuna.samplers.GPSampler(seed=seed, n_startup_trials=n_startup_trials)
+        raise ValueError(f"Unknown search_bo_sampler '{sampler_name}'. Choose 'tpe' or 'gp'.")
+
+    def _bo_distortion_space(self, mode):
+        """The distortion dimension(s) of the BO search space."""
+        import optuna
+
+        if mode == "continuous":
+            a_low, a_high = self.cfg.sample.search_distortion_a_range
+            b_low, b_high = self.cfg.sample.search_distortion_b_range
+            return {
+                "distortion_a": optuna.distributions.FloatDistribution(a_low, a_high),
+                "distortion_b": optuna.distributions.FloatDistribution(b_low, b_high),
+            }
+        if mode == "categorical":
+            return {
+                "time_distortion": optuna.distributions.CategoricalDistribution(
+                    ["identity", "polydec", "cos", "revcos", "polyinc"]
+                )
+            }
+        raise ValueError(
+            f"Unknown search_bo_distortion_mode '{mode}'. Choose 'continuous' or 'categorical'."
+        )
+
+    def _bo_apply_distortion(self, params, mode):
+        """Push this trial's distortion live; return (label, {csv column: value})."""
+        if mode == "continuous":
+            a, b = float(params["distortion_a"]), float(params["distortion_b"])
+            self._apply_sampling_config(distortor="continuous", a=a, b=b)
+            return f"a: {a:.4f}, b: {b:.4f}", {"distortion_a": a, "distortion_b": b}
+        distortor = str(params["time_distortion"])
+        self._apply_sampling_config(distortor=distortor)
+        return f"distortor: {distortor}", {"distortor": distortor}
+
     def _save_optuna_visualizations(self, study, num_step, sampler_name):
         from optuna import visualization as viz
 
@@ -997,11 +1101,16 @@ class GraphDiscreteFlowModel(pl.LightningModule):
             print("  [viz] plotly not installed; skipping Optuna plots")
             return
         tag = f"{sampler_name}_numstep{num_step}"
-        for name, build in (
-            ("optimization_history", viz.plot_optimization_history),
-            ("slice", viz.plot_slice),
-            ("param_importances", viz.plot_param_importances),
-        ):
+        plots = (
+            (("pareto_front", viz.plot_pareto_front), ("slice", viz.plot_slice))
+            if len(study.directions) > 1
+            else (
+                ("optimization_history", viz.plot_optimization_history),
+                ("slice", viz.plot_slice),
+                ("param_importances", viz.plot_param_importances),
+            )
+        )
+        for name, build in plots:
             try:
                 build(study).write_html(f"optuna_{tag}_{name}.html")
             except Exception as e:
@@ -1040,6 +1149,7 @@ class GraphDiscreteFlowModel(pl.LightningModule):
             "full_grid": self.search_full_grid,
             "random": self.search_random,
             "sobol": self.search_sobol,
+            "bo": self.search_bayesian_optimization,
         }
         if self.cfg.sample.search == "all":
             to_run = ["distortion", "stochasticity", "target_guidance"]
@@ -1089,7 +1199,7 @@ class GraphDiscreteFlowModel(pl.LightningModule):
         self.cfg.sample.time_distortion = "identity"
 
         # save the final results
-        results_df.reset_index(inplace=True)
+        results_df.reset_index(drop=True, inplace=True)
         results_df.set_index(["num_step", "distortor"], inplace=True)
         results_df.to_csv(f"search_distortion.csv")
 
@@ -1115,12 +1225,10 @@ class GraphDiscreteFlowModel(pl.LightningModule):
                 # save at each step as well
                 results_df.to_csv(f"search_stochasticity.csv")
 
-        # set back to default value
         self.cfg.sample.eta = 0.0
         self.rate_matrix_designer.eta = 0.0
 
-        # save the final results
-        results_df.reset_index(inplace=True)
+        results_df.reset_index(drop=True, inplace=True)
         results_df.set_index(["num_step", "eta"], inplace=True)
         results_df.to_csv(f"search_stochasticity.csv")
 
@@ -1142,8 +1250,8 @@ class GraphDiscreteFlowModel(pl.LightningModule):
             0.5,
             1.0,
             2.0,
-        ]  # tunable based on requirements
-        # omega_list = [0.5, 0.01]  # tunable based on requirements
+        ]  
+        
 
         for num_step in num_step_list:
             for omega in omega_list:
@@ -1156,15 +1264,12 @@ class GraphDiscreteFlowModel(pl.LightningModule):
                 samples, labels, res, config_time = self._sample_and_evaluate()
                 res_df = self._result_row(res, num_step=num_step, omega=omega, time_s=config_time)
                 results_df = pd.concat([results_df, res_df], ignore_index=True)
-                # save at each step as well
                 results_df.to_csv(f"search_target_guidance.csv")
 
-        # set back to default value
         self.cfg.sample.omega = 0.0
         self.rate_matrix_designer.omega = 0.0
 
-        # save the final results
-        results_df.reset_index(inplace=True)
+        results_df.reset_index(drop=True, inplace=True)
         results_df.set_index(["num_step", "omega"], inplace=True)
         results_df.to_csv(f"search_target_guidance.csv")
 
@@ -1200,7 +1305,7 @@ class GraphDiscreteFlowModel(pl.LightningModule):
 
         self._reset_sampling_config()
 
-        results_df.reset_index(inplace=True)
+        results_df.reset_index(drop=True, inplace=True)
         results_df.set_index(key_cols, inplace=True)
         self._save_search_checkpoint(results_df, checkpoint_path)
         self._mark_search_done(version_dir)
@@ -1253,7 +1358,7 @@ class GraphDiscreteFlowModel(pl.LightningModule):
 
         self._reset_sampling_config()
 
-        results_df.reset_index(inplace=True)
+        results_df.reset_index(drop=True, inplace=True)
         results_df.set_index(["num_step", "distortor", "eta", "omega"], inplace=True)
         self._save_search_checkpoint(results_df, checkpoint_path)
         self._mark_search_done(version_dir)
@@ -1261,11 +1366,7 @@ class GraphDiscreteFlowModel(pl.LightningModule):
 
     def search_sobol(self, num_step_list):
         """
-        Sobol (scrambled QMC) search over distortion x eta x omega.
-
-        The study lives in a sqlite file inside the version directory, so an
-        interrupted run picks the sequence up exactly where it stopped.
-        """
+        Sobol (scrambled QMC) search over distortion x eta x omega."""
         import optuna
 
         optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -1274,7 +1375,9 @@ class GraphDiscreteFlowModel(pl.LightningModule):
         eta_low, eta_high = self.cfg.sample.search_eta_range
         omega_low, omega_high = self.cfg.sample.search_omega_range
         n_trials = self.cfg.sample.search_n_trials
-        objective_col = self.cfg.sample.search_objective
+        objective_cols, directions = objective_spec(
+            self.cfg.sample.search_objective, self.cfg.dataset.directed
+        )
         search_space = {
             "eta": optuna.distributions.FloatDistribution(eta_low, eta_high),
             "omega": optuna.distributions.FloatDistribution(omega_low, omega_high),
@@ -1285,7 +1388,6 @@ class GraphDiscreteFlowModel(pl.LightningModule):
             "sobol", tags=(self.cfg.dataset.name, f"seed{self.cfg.sample.search_seed}")
         )
         checkpoint_path = os.path.join(version_dir, "results.csv")
-        storage = f"sqlite:///{os.path.join(version_dir, 'study.db')}"
         results_df, completed = self._load_search_checkpoint(
             checkpoint_path, ["num_step", "trial_idx"], {"num_step": int, "trial_idx": int}
         )
@@ -1295,28 +1397,22 @@ class GraphDiscreteFlowModel(pl.LightningModule):
         executed = 0
         for num_step in num_step_list:
             study = optuna.create_study(
-                direction="minimize",
-                study_name=f"numstep{num_step}",
-                storage=storage,
-                load_if_exists=True,
                 sampler=optuna.samplers.QMCSampler(
                     qmc_type="sobol", scramble=True, seed=self.cfg.sample.search_seed
                 ),
+                **({"direction": directions[0]} if len(directions) == 1 else {"directions": directions}),
             )
-            if not study.trials:
-                # the first ask has no completed trial to infer the space from and
-                # falls back to independent sampling, so burn it
-                study.tell(study.ask(search_space), state=optuna.trial.TrialState.PRUNED)
-            # a trial asked but never told -- the job was killed mid-evaluation -- still
-            # owns its point of the sequence, so re-run it rather than leave a gap
-            pending = list(study.get_trials(deepcopy=False, states=(optuna.trial.TrialState.RUNNING,)))
-            done_states = (optuna.trial.TrialState.COMPLETE, optuna.trial.TrialState.FAIL)
-            if len(study.get_trials(deepcopy=False, states=done_states)):
-                print(f"Resuming the sobol sequence for num_step={num_step}.")
+            # the first ask has no completed trial to infer the space from and falls
+            # back to independent sampling, so burn it
+            study.tell(self._ask(study, search_space), state=optuna.trial.TrialState.PRUNED)
+            n_done = self._replay_trials(
+                study, results_df, num_step, search_space,
+                {"eta": "eta", "omega": "omega_raw", "distortion_u": "distortion_u"},
+                objective_cols, "sobol",
+            )
 
-            while len(study.get_trials(deepcopy=False, states=done_states)) < n_trials:
-                trial = pending.pop(0) if pending else study.ask(search_space)
-                trial_idx = trial.number - 1  # the warmup trial took number 0
+            for trial_idx in range(n_done, n_trials):
+                trial = self._ask(study, search_space)
                 eta = float(trial.params["eta"])
                 omega_raw = float(trial.params["omega"])
                 omega = self._omega_power_transform(omega_raw)
@@ -1334,17 +1430,18 @@ class GraphDiscreteFlowModel(pl.LightningModule):
                 self._print_progress(config_time, executed, n_todo, search_start)
                 # omega is what was sampled with, omega_raw the draw before the power transform
                 res_df = self._result_row(res, num_step=num_step, distortor=distortor, eta=eta, omega=omega, omega_raw=omega_raw, distortion_u=trial.params["distortion_u"], trial_idx=trial_idx, time_s=config_time)
-                if objective_col not in res_df:
+                missing = [c for c in objective_cols if c not in res_df]
+                if missing:
                     raise KeyError(
-                        f"sample.search_objective '{objective_col}' is not among the "
-                        f"evaluated metrics: {sorted(res_df.columns)}"
+                        f"sample.search_objective '{self.cfg.sample.search_objective}' needs "
+                        f"column(s) {missing}, not among the evaluated metrics: {sorted(res_df.columns)}"
                     )
 
-                value = float(res_df[objective_col].iloc[0])
-                if np.isfinite(value):
-                    study.tell(trial.number, value)
+                values = [float(res_df[col].iloc[0]) for col in objective_cols]
+                if all(np.isfinite(v) for v in values):
+                    study.tell(trial, values[0] if len(values) == 1 else values)
                 else:
-                    study.tell(trial.number, state=optuna.trial.TrialState.FAIL)
+                    study.tell(trial, state=optuna.trial.TrialState.FAIL)
                 results_df = pd.concat([results_df, res_df], ignore_index=True)
                 self._save_search_checkpoint(results_df, checkpoint_path)
 
@@ -1353,8 +1450,115 @@ class GraphDiscreteFlowModel(pl.LightningModule):
 
         self._reset_sampling_config()
 
-        results_df.reset_index(inplace=True)
+        results_df.reset_index(drop=True, inplace=True)
         results_df.set_index(["num_step", "distortor", "eta", "omega"], inplace=True)
         self._save_search_checkpoint(results_df, checkpoint_path)
         self._mark_search_done(version_dir)
         print(f"search_sobol results checkpointed at {checkpoint_path}")
+
+    def search_bayesian_optimization(self, num_step_list):
+        """Bayesian optimization over distortion x eta x omega."""
+        import optuna
+
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+        sampler_name = self.cfg.sample.search_bo_sampler
+        mode = self.cfg.sample.search_bo_distortion_mode
+        n_trials = self.cfg.sample.search_n_trials
+        objective_cols, directions = objective_spec(
+            self.cfg.sample.search_objective, self.cfg.dataset.directed
+        )
+        eta_low, eta_high = self.cfg.sample.search_eta_range
+        omega_low, omega_high = self.cfg.sample.search_omega_range
+        search_space = {
+            "eta": optuna.distributions.FloatDistribution(eta_low, eta_high),
+            "omega": optuna.distributions.FloatDistribution(omega_low, omega_high),
+            **self._bo_distortion_space(mode),
+        }
+
+        version_dir = self._search_version_dir(
+            "bo",
+            tags=(self.cfg.dataset.name, sampler_name, mode, f"seed{self.cfg.sample.search_seed}"),
+        )
+        checkpoint_path = os.path.join(version_dir, "results.csv")
+        results_df, completed = self._load_search_checkpoint(
+            checkpoint_path, ["num_step", "trial_idx"], {"num_step": int, "trial_idx": int}
+        )
+        param_cols = {"eta": "eta", "omega": "omega"}
+        param_cols.update(
+            {"distortion_a": "distortion_a", "distortion_b": "distortion_b"}
+            if mode == "continuous"
+            else {"time_distortion": "distortor"}
+        )
+
+        n_todo = len(num_step_list) * n_trials - len(completed)
+        search_start = time.time()
+        executed = 0
+        best = {}
+        for num_step in num_step_list:
+            study = optuna.create_study(
+                sampler=self._make_bo_sampler(
+                    sampler_name, self.cfg.sample.search_bo_n_startup_trials
+                ),
+                **({"direction": directions[0]} if len(directions) == 1 else {"directions": directions}),
+            )
+            n_done = self._replay_trials(
+                study, results_df, num_step, search_space, param_cols, objective_cols, sampler_name
+            )
+
+            for trial_idx in range(n_done, n_trials):
+                trial = self._ask(study, search_space)
+                eta = float(trial.params["eta"])
+                omega = float(trial.params["omega"])
+                distortion_label, distortion_values = self._bo_apply_distortion(trial.params, mode)
+                self._apply_sampling_config(num_step=num_step, eta=eta, omega=omega)
+
+                executed += 1
+                print(
+                    f"############# [{executed}/{n_todo}] BO trial ({sampler_name}): "
+                    f"num_steps: {num_step}, {distortion_label}, eta: {eta:.4f}, "
+                    f"omega: {omega:.4f} #############"
+                )
+                samples, labels, res, config_time = self._sample_and_evaluate()
+                self._print_progress(config_time, executed, n_todo, search_start)
+                res_df = self._result_row(res, num_step=num_step, **distortion_values, eta=eta, omega=omega, trial_idx=trial_idx, time_s=config_time)
+                missing = [c for c in objective_cols if c not in res_df]
+                if missing:
+                    raise KeyError(
+                        f"sample.search_objective '{self.cfg.sample.search_objective}' needs "
+                        f"column(s) {missing}, not among the evaluated metrics: {sorted(res_df.columns)}"
+                    )
+
+                values = [float(res_df[col].iloc[0]) for col in objective_cols]
+                if all(np.isfinite(v) for v in values):
+                    study.tell(trial, values[0] if len(values) == 1 else values)
+                else:
+                    study.tell(trial, state=optuna.trial.TrialState.FAIL)
+                results_df = pd.concat([results_df, res_df], ignore_index=True)
+                self._save_search_checkpoint(results_df, checkpoint_path)
+
+            # one best trial for a single objective, the whole Pareto front for 'both'
+            best[num_step] = [(t.values, t.params) for t in study.best_trials]
+            if self.cfg.sample.search_visualize:
+                self._save_optuna_visualizations(study, num_step, sampler_name)
+
+        self._reset_sampling_config()
+
+        self._search_summary_info += [
+            f"sampler: {sampler_name} (distortion mode: {mode})",
+            f"objective: {self.cfg.sample.search_objective} -> "
+            + ", ".join(f"{c} ({d})" for c, d in zip(objective_cols, directions)),
+        ] + [
+            f"best[num_step={ns}]: "
+            + ", ".join(f"{c}={v:.6f}" for c, v in zip(objective_cols, values))
+            + " at " + ", ".join(f"{k}={v}" for k, v in params.items())
+            for ns, trials in best.items()
+            for values, params in trials
+        ]
+
+        distortion_cols = ("distortion_a", "distortion_b") if mode == "continuous" else ("distortor",)
+        results_df.reset_index(drop=True, inplace=True)
+        results_df.set_index(["num_step", *distortion_cols, "eta", "omega"], inplace=True)
+        self._save_search_checkpoint(results_df, checkpoint_path)
+        self._mark_search_done(version_dir)
+        print(f"search_bayesian_optimization results checkpointed at {checkpoint_path}")
