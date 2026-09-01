@@ -315,6 +315,10 @@ class GraphDiscreteFlowModel(pl.LightningModule):
 
         # Otherwise, generate new samples
         if is_test:
+            if self.cfg.general.bootstrapping and self.cfg.general.num_sample_fold != 1:
+                raise ValueError(
+                    "When bootstrapping is enabled, num_sample_fold must be 1."
+                )
             samples_to_generate = (
                 self.cfg.general.final_model_samples_to_generate
                 * self.cfg.general.num_sample_fold
@@ -405,13 +409,27 @@ class GraphDiscreteFlowModel(pl.LightningModule):
         to_log = {}
         samples_to_evaluate = self.cfg.general.final_model_samples_to_generate
         if is_test:
-            for i in range(self.cfg.general.num_sample_fold):
-                cur_samples = samples[
-                    i * samples_to_evaluate : (i + 1) * samples_to_evaluate
+            if self.cfg.general.bootstrapping:
+                num_bootstrap_fold = self.cfg.general.num_bootstrap_fold
+                n_total = len(samples)
+                # each fold scores (K-1)/K of the generated pool
+                n_samples_to_evaluate = max(
+                    1, (n_total * (num_bootstrap_fold - 1)) // num_bootstrap_fold
+                )
+
+                fold_indices = [
+                    np.random.choice(n_total, size=n_samples_to_evaluate, replace=False)
+                    for _ in range(num_bootstrap_fold)
                 ]
-                cur_labels = labels[
-                    i * samples_to_evaluate : (i + 1) * samples_to_evaluate
+            else:
+                fold_indices = [
+                    range(i * samples_to_evaluate, (i + 1) * samples_to_evaluate)
+                    for i in range(self.cfg.general.num_sample_fold)
                 ]
+
+            for i, idx in enumerate(fold_indices):
+                cur_samples = [samples[j] for j in idx]
+                cur_labels = [labels[j] for j in idx]
 
                 cur_to_log = self.sampling_metrics.forward(
                     cur_samples,

@@ -28,5 +28,7 @@ final_model_chains_to_save: 20
 evaluate_all_checkpoints: False
 
 num_sample_fold: 1
+bootstrapping: False
+num_bootstrap_fold: 5          # number of subsamples scored per sampling config; each fold scores (K-1)/K of the pool
 save_samples: False
 save_visualization: True
