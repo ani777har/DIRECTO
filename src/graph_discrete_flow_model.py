@@ -1135,7 +1135,7 @@ class GraphDiscreteFlowModel(pl.LightningModule):
         The num_step_list is tunable based on requirements.
         """
 
-        num_step_list = [100] #[50, 1000]  # [5, 10, 50, 100, 1000]
+        num_step_list = [50] #[50, 1000]  # [5, 10, 50, 100, 1000]
 
         if self.cfg.dataset.name == "qm9":
             num_step_list = [1, 5, 10, 50, 100, 500]
@@ -1181,26 +1181,30 @@ class GraphDiscreteFlowModel(pl.LightningModule):
         results_df = pd.DataFrame()
         distortion_list = ["identity", "polydec", "cos", "revcos", "polyinc"]
         # distortion_list = ["identity", "polydec"]
+        seed_list = [0, 1, 2]
 
-        for num_step in num_step_list:
-            for distortor in distortion_list:
-                self.cfg.sample.sample_steps = num_step
-                self.cfg.sample.time_distortion = distortor
-                print(
-                    f"############# Testing num steps: {num_step}, distortor: {distortor} #############"
-                )
-                samples, labels, res, config_time = self._sample_and_evaluate()
-                res_df = self._result_row(res, num_step=num_step, distortor=distortor, time_s=config_time)
-                results_df = pd.concat([results_df, res_df], ignore_index=True)
-                # save at each step as well
-                results_df.to_csv(f"search_distortion.csv")
+        for seed in seed_list:
+            pl.seed_everything(seed)
+
+            for num_step in num_step_list:
+                for distortor in distortion_list:
+                    self.cfg.sample.sample_steps = num_step
+                    self.cfg.sample.time_distortion = distortor
+                    print(
+                        f"############# Testing num steps: {num_step}, distortor: {distortor}, seed: {seed} #############"
+                    )
+                    samples, labels, res, config_time = self._sample_and_evaluate()
+                    res_df = self._result_row(res, num_step=num_step, distortor=distortor, seed=seed, time_s=config_time)
+                    results_df = pd.concat([results_df, res_df], ignore_index=True)
+                    # save at each step as well
+                    results_df.to_csv(f"search_distortion.csv")
 
         # set back to default value
         self.cfg.sample.time_distortion = "identity"
 
         # save the final results
         results_df.reset_index(drop=True, inplace=True)
-        results_df.set_index(["num_step", "distortor"], inplace=True)
+        results_df.set_index(["num_step", "distortor", "seed"], inplace=True)
         results_df.to_csv(f"search_distortion.csv")
 
     def search_stochasticity(self, num_step_list):
@@ -1211,25 +1215,30 @@ class GraphDiscreteFlowModel(pl.LightningModule):
         results_df = pd.DataFrame()
         eta_list = [0.0, 5, 10, 25, 50, 100, 200]
         # eta_list = [5, 10]
-        for num_step in num_step_list:
-            for eta in eta_list:
-                self.cfg.sample.sample_steps = num_step
-                self.cfg.sample.eta = eta
-                self.rate_matrix_designer.eta = eta
-                print(
-                    f"############# Testing num steps: {num_step}, eta: {eta} #############"
-                )
-                samples, labels, res, config_time = self._sample_and_evaluate()
-                res_df = self._result_row(res, num_step=num_step, eta=eta, time_s=config_time)
-                results_df = pd.concat([results_df, res_df], ignore_index=True)
-                # save at each step as well
-                results_df.to_csv(f"search_stochasticity.csv")
+        seed_list = [0, 1, 2]
+
+        for seed in seed_list:
+            pl.seed_everything(seed)
+
+            for num_step in num_step_list:
+                for eta in eta_list:
+                    self.cfg.sample.sample_steps = num_step
+                    self.cfg.sample.eta = eta
+                    self.rate_matrix_designer.eta = eta
+                    print(
+                        f"############# Testing num steps: {num_step}, eta: {eta}, seed: {seed} #############"
+                    )
+                    samples, labels, res, config_time = self._sample_and_evaluate()
+                    res_df = self._result_row(res, num_step=num_step, eta=eta, seed=seed, time_s=config_time)
+                    results_df = pd.concat([results_df, res_df], ignore_index=True)
+                    # save at each step as well
+                    results_df.to_csv(f"search_stochasticity.csv")
 
         self.cfg.sample.eta = 0.0
         self.rate_matrix_designer.eta = 0.0
 
         results_df.reset_index(drop=True, inplace=True)
-        results_df.set_index(["num_step", "eta"], inplace=True)
+        results_df.set_index(["num_step", "eta", "seed"], inplace=True)
         results_df.to_csv(f"search_stochasticity.csv")
 
     def search_target_guidance(self, num_step_list):
@@ -1250,27 +1259,30 @@ class GraphDiscreteFlowModel(pl.LightningModule):
             0.5,
             1.0,
             2.0,
-        ]  
-        
+        ]
+        seed_list = [0, 1, 2]
 
-        for num_step in num_step_list:
-            for omega in omega_list:
-                self.cfg.sample.sample_steps = num_step
-                self.cfg.sample.omega = omega
-                self.rate_matrix_designer.omega = omega
-                print(
-                    f"############# Testing num steps: {num_step}, omega: {omega} #############"
-                )
-                samples, labels, res, config_time = self._sample_and_evaluate()
-                res_df = self._result_row(res, num_step=num_step, omega=omega, time_s=config_time)
-                results_df = pd.concat([results_df, res_df], ignore_index=True)
-                results_df.to_csv(f"search_target_guidance.csv")
+        for seed in seed_list:
+            pl.seed_everything(seed)
+
+            for num_step in num_step_list:
+                for omega in omega_list:
+                    self.cfg.sample.sample_steps = num_step
+                    self.cfg.sample.omega = omega
+                    self.rate_matrix_designer.omega = omega
+                    print(
+                        f"############# Testing num steps: {num_step}, omega: {omega}, seed: {seed} #############"
+                    )
+                    samples, labels, res, config_time = self._sample_and_evaluate()
+                    res_df = self._result_row(res, num_step=num_step, omega=omega, seed=seed, time_s=config_time)
+                    results_df = pd.concat([results_df, res_df], ignore_index=True)
+                    results_df.to_csv(f"search_target_guidance.csv")
 
         self.cfg.sample.omega = 0.0
         self.rate_matrix_designer.omega = 0.0
 
         results_df.reset_index(drop=True, inplace=True)
-        results_df.set_index(["num_step", "omega"], inplace=True)
+        results_df.set_index(["num_step", "omega", "seed"], inplace=True)
         results_df.to_csv(f"search_target_guidance.csv")
 
     def search_full_grid(self, num_step_list):
