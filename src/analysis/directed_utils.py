@@ -987,15 +987,18 @@ def _isomorphism_alarm_handler(signum, frame):
 
 def is_isomorphic_with_timeout(fake_g, train_g, timeout=5):
     """Check if two graphs are isomorphic with a wall-clock timeout.
+
+    Uses VF2++ rather than VF2: same predicate, but its node ordering avoids the
+    backtracking blowup that made sparse labelled DAGs (tpu_tile) hit the timeout.
+    The timeout is kept as a safety net for pathological pairs.
     """
     old_handler = signal.signal(signal.SIGALRM, _isomorphism_alarm_handler)
     signal.setitimer(signal.ITIMER_REAL, timeout)
     try:
         is_attributed = "label" in train_g.nodes[0]
-        node_match_fn = (
-            (lambda x, y: x["label"] == y["label"]) if is_attributed else None
+        result = nx.vf2pp_is_isomorphic(
+            fake_g, train_g, node_label="label" if is_attributed else None
         )
-        result = nx.is_isomorphic(fake_g, train_g, node_match=node_match_fn)
         return False, result
     except TimeoutError:
         print("is_isomorphic took too long!")
