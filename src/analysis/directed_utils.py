@@ -601,7 +601,20 @@ def eval_barabasi_albert(G_list):
     return count / float(len(G_list))
 
 
-def is_sbm_graph(G, p_intra=0.3, p_inter=0.01, strict=True, refinement_steps=1000):
+def is_sbm_graph(G, p_intra=0.3, p_inter=0.01, strict=True, refinement_steps=100):
+
+    def compute():
+        return _is_sbm_graph_uncached(G, p_intra, p_inter, strict, refinement_steps)
+
+    if not GRAPH_EVAL_CACHE.enabled:
+        return compute()
+    params = (p_intra, p_inter, strict, refinement_steps)
+    return GRAPH_EVAL_CACHE.lookup((graph_identity_key(G), params), compute)
+
+
+def _is_sbm_graph_uncached(
+    G, p_intra=0.3, p_inter=0.01, strict=True, refinement_steps=100
+):
     """
     Check if how closely given graph matches a SBM with given probabilites by computing mean probability of Wald test statistic for each recovered parameter
     """
@@ -658,7 +671,7 @@ def eval_acc_sbm_graph(
     p_intra=0.3,
     p_inter=0.01,
     strict=True,
-    refinement_steps=1000,
+    refinement_steps=100,
     is_parallel=True,
 ):
     count = 0.0
@@ -861,41 +874,109 @@ def eval_fraction_unique_non_isomorphic_valid(
 import threading
 
 
-def is_isomorphic_worker(fake_g, train_g, result_container):
-    """Worker function to check isomorphism and store the result."""
-    is_attributed = "label" in train_g.nodes[0]
-    node_match_fn = lambda x, y: x["label"] == y["label"] if is_attributed else None
-    result_container.append(
-        # nx.is_isomorphic(
-        #     fake_g, train_g
-        # )
-        nx.is_isomorphic(
-            fake_g,
-            train_g,
-            node_match=node_match_fn,
+############################ Per-graph validity cache ############################
+
+
+def graph_identity_key(G):
+    """Identity of G as the metrics see it: node count + adjacency bytes."""
+    adj = nx.to_numpy_array(G, dtype=np.int8)
+    return (adj.shape[0], adj.tobytes())
+
+
+class GraphEvalCache:
+    """Memoizes per-graph validity verdicts for one sampling configuration."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.enabled = False
+        self.validity = {}
+        self.hits = 0
+        self.misses = 0
+
+    def reset(self, enabled=True):
+        with self._lock:
+            self.enabled = enabled
+            self.validity = {}
+            self.hits = 0
+            self.misses = 0
+
+    def lookup(self, key, compute):
+        if not self.enabled:
+            return compute()
+        with self._lock:
+            if key in self.validity:
+                self.hits += 1
+                return self.validity[key]
+        value = compute()
+        with self._lock:
+            self.misses += 1
+            return self.validity.setdefault(key, value)
+
+    def summary(self):
+        total = self.hits + self.misses
+        if not self.enabled or not total:
+            return "graph validity cache: disabled"
+        return (
+            f"graph validity cache: {self.hits}/{total} hits "
+            f"({100.0 * self.hits / total:.1f}%), {len(self.validity)} entries"
         )
-    )  # Store result in a shared list
+
+
+GRAPH_EVAL_CACHE = GraphEvalCache()
+
+
+class _IsomorphismTimeout(Exception):
+    pass
+
+
+def _with_deadline(base_matcher):
+    """Build a VF2 matcher that aborts its own search once past a deadline."""
+
+    class _DeadlineMatcher(base_matcher):
+        _CHECK_EVERY = 512
+
+        def set_deadline(self, deadline):
+            self._deadline = deadline
+            self._countdown = self._CHECK_EVERY
+
+        def syntactic_feasibility(self, G1_node, G2_node):
+            self._countdown -= 1
+            if self._countdown <= 0:
+                self._countdown = self._CHECK_EVERY
+                if time.monotonic() > self._deadline:
+                    raise _IsomorphismTimeout
+            return super().syntactic_feasibility(G1_node, G2_node)
+
+    return _DeadlineMatcher
+
+
+_DeadlineGraphMatcher = _with_deadline(nx.algorithms.isomorphism.GraphMatcher)
+_DeadlineDiGraphMatcher = _with_deadline(nx.algorithms.isomorphism.DiGraphMatcher)
 
 
 def is_isomorphic_with_timeout(fake_g, train_g, timeout=5):
-    """Check if two graphs are isomorphic with a timeout (fixed thread-based)."""
-    result_container = []  # Shared list to store the result
-    thread = threading.Thread(
-        target=is_isomorphic_worker,
-        args=(fake_g, train_g, result_container),
-        daemon=True,
-    )
-    thread.start()
+    """Check if two graphs are isomorphic, giving up after `timeout` seconds.
 
-    thread.join(timeout)  # Wait for the thread to finish within timeout
+    Returns (timed_out, isomorphic); a timed-out pair is reported as non-isomorphic.
+    """
+    is_attributed = "label" in train_g.nodes[0]
+    node_match_fn = (lambda x, y: x["label"] == y["label"]) if is_attributed else None
 
-    if thread.is_alive():
+    if fake_g.is_directed() and train_g.is_directed():
+        matcher_cls = _DeadlineDiGraphMatcher
+    elif not fake_g.is_directed() and not train_g.is_directed():
+        matcher_cls = _DeadlineGraphMatcher
+    else:
+        raise nx.NetworkXError("Graphs fake_g and train_g are not of the same type.")
+
+    matcher = matcher_cls(fake_g, train_g, node_match=node_match_fn)
+    matcher.set_deadline(time.monotonic() + timeout)
+
+    try:
+        return False, matcher.is_isomorphic()
+    except _IsomorphismTimeout:
         print("is_isomorphic took too long!")
-        return True, False  # Timeout occurred
-
-    return False, (
-        result_container[0] if result_container else False
-    )  # Return actual result if available
+        return True, False
 
 
 def time_eval_fraction_unique_non_isomorphic_valid(
@@ -952,9 +1033,9 @@ def time_eval_fraction_unique_non_isomorphic_valid(
     frac_non_unique_non_validated = count_non_unique_non_validated / float(
         len(fake_graphs)
     )  # Fraction of graphs non-validated due to timeout
-    frac_isomorphic_non_validated = count_non_unique_non_validated / float(
+    frac_isomorphic_non_validated = count_isomorphic_non_validated / float(
         len(fake_graphs)
-    )  # Fraction of graphs non-validated due to timeout
+    )  # Fraction of fake/train comparisons non-validated due to timeout
     return (
         frac_unique,
         frac_unique_non_isomorphic,

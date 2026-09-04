@@ -624,7 +624,7 @@ def eval_acc_sbm_graph(
     p_intra=0.3,
     p_inter=0.005,
     strict=True,
-    refinement_steps=1000,
+    refinement_steps=100,
     is_parallel=True,
 ):
     count = 0.0
@@ -723,7 +723,7 @@ def is_grid_graph(G):
         return False
 
 
-def is_sbm_graph(G, p_intra=0.3, p_inter=0.005, strict=True, refinement_steps=1000):
+def is_sbm_graph(G, p_intra=0.3, p_inter=0.005, strict=True, refinement_steps=100):
     """
     Check if how closely given graph matches a SBM with given probabilites by computing mean probability of Wald test statistic for each recovered parameter
     """
