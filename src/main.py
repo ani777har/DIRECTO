@@ -3,6 +3,12 @@ import os
 import pathlib
 import warnings
 
+import numpy as np
+
+# pytorch_lightning 2.0.4 calls np.Inf, removed in numpy 2.0
+if not hasattr(np, "Inf"):
+    np.Inf = np.inf
+
 import torch
 
 torch.cuda.empty_cache()
