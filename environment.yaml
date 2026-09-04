@@ -1,5 +1,6 @@
 name: directo
 channels:
+  - dglteam/label/th24_cu121
   - pytorch
   - nvidia
   - conda-forge
@@ -11,6 +12,7 @@ dependencies:
   - pytorch-cuda=12.1
   - psi4=1.9.1
   - pip=25.1.1
+  - dgl=2.4.0.th24.cu121=py311_0
   - pip:
       - ipykernel==6.29.5
       - hydra-core==1.3.2
@@ -32,4 +34,12 @@ dependencies:
       - seaborn==0.13.2
       - gpustat==0.6.0
       - black==24.3.0
-      - e .
+      - optuna==4.9.0      # sobol / bo sampling searches; pinned because resuming a
+                           # search continues the same sequence
+      - plotly==6.9.0      # sample.search_visualize, Optuna's html plots
+      - optunahub==0.4.1   # only needed for search_bo_sampler=hebo, which downloads
+                           # the sampler from hub.optuna.org at runtime.
+                           # HEBO itself is NOT installable here: it pins numpy<1.25
+                           # against this env's numpy 2.3.1. Use 'gp' or 'tpe', which
+                           # are built into optuna, or see README for a separate env.
+      - --editable .

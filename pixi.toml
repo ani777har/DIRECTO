@@ -40,4 +40,7 @@ torchdata = "*"
 seaborn = "==0.13.2"
 gpustat = "==0.6.0"
 black = "==24.3.0"
+optuna = "==4.9.0"
+plotly = "==6.9.0"
+optunahub = "==0.4.1"   # search_bo_sampler=hebo only; HEBO itself pins numpy<1.25
 directo = {path=".", editable = true}
