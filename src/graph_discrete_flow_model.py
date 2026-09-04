@@ -15,7 +15,7 @@ from torch.distributions.categorical import Categorical
 from models.transformer_model import GraphTransformer
 from models.transformer_model_directed import GraphTransformerDirected
 
-from analysis.directed_utils import GRAPH_EVAL_CACHE
+from src.analysis.directed_utils import GRAPH_EVAL_CACHE
 from metrics.train_metrics import TrainLossDiscrete
 from src import utils
 from flow_matching.noise_distribution import NoiseDistribution
