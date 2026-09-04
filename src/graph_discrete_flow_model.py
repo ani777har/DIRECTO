@@ -1,6 +1,7 @@
 import time
 import wandb
 import os
+import csv
 import random
 import itertools
 
@@ -19,6 +20,7 @@ from hydra.utils import get_original_cwd
 from models.transformer_model import GraphTransformer
 from models.transformer_model_directed import GraphTransformerDirected
 
+from analysis.directed_utils import GRAPH_EVAL_CACHE
 from metrics.train_metrics import TrainLossDiscrete
 from src import utils
 from flow_matching.noise_distribution import NoiseDistribution
@@ -405,16 +407,31 @@ class GraphDiscreteFlowModel(pl.LightningModule):
     ):
         print("Computing sampling metrics...")
 
+        # Folds re-score overlapping subsets of one generated pool, so per-graph
+        # results are cached for this config and dropped before the next one.
+        GRAPH_EVAL_CACHE.reset(enabled=self.cfg.general.cache_graph_eval)
+
         to_log = {}
         samples_to_evaluate = self.cfg.general.final_model_samples_to_generate
         if is_test:
             if self.cfg.general.bootstrapping:
                 num_bootstrap_fold = self.cfg.general.num_bootstrap_fold
                 n_total = len(samples)
-                # each fold scores (K-1)/K of the generated pool
-                n_samples_to_evaluate = max(
-                    1, (n_total * (num_bootstrap_fold - 1)) // num_bootstrap_fold
+                # each fold scores (K-1)/K of the generated pool, unless an explicit
+                # subsample size is given
+                n_samples_to_evaluate = self.cfg.general.get(
+                    "bootstrap_samples_to_evaluate", None
                 )
+                if n_samples_to_evaluate is None:
+                    n_samples_to_evaluate = max(
+                        1, (n_total * (num_bootstrap_fold - 1)) // num_bootstrap_fold
+                    )
+                elif not 1 <= n_samples_to_evaluate <= n_total:
+                    # folds are drawn without replacement, so the pool is a hard cap
+                    raise ValueError(
+                        f"bootstrap_samples_to_evaluate must be in [1, {n_total}] "
+                        f"(the generated pool size), got {n_samples_to_evaluate}."
+                    )
 
                 fold_indices = [
                     np.random.choice(n_total, size=n_samples_to_evaluate, replace=False)
@@ -457,6 +474,7 @@ class GraphDiscreteFlowModel(pl.LightningModule):
                 i: (np.array(to_log[i]).mean(), np.array(to_log[i]).std())
                 for i in to_log
             }
+            print(GRAPH_EVAL_CACHE.summary())
         else:
             to_log = self.sampling_metrics.forward(
                 samples,
@@ -912,9 +930,17 @@ class GraphDiscreteFlowModel(pl.LightningModule):
         text = str(value).strip().lower()
         return "".join(c if (c.isalnum() or c in "-_.") else "-" for c in text)
 
+    def _dataset_tag(self):
+        parts = [self._slugify(self.cfg.dataset.name)]
+        graph_type = self.cfg.dataset.get("graph_type", None)
+        if graph_type:
+            suffix = "_dag" if self.cfg.dataset.get("acyclic", False) else ""
+            parts.append(self._slugify(graph_type) + suffix)
+        return "-".join(parts)
+
     def _search_version_dir(self, search_name, tags=()):
-        """Claim outputs/<search>_<tags>/version_N, resuming the latest unfinished one."""
-        parts = [search_name] + [
+        """Claim outputs/<search>_<dataset>_<tags>/version_N, resuming the latest unfinished one."""
+        parts = [search_name, self._dataset_tag()] + [
             self._slugify(t) for t in tags if t is not None and str(t) != ""
         ]
         base_dir = os.path.abspath(
@@ -951,6 +977,21 @@ class GraphDiscreteFlowModel(pl.LightningModule):
             f"Could not claim a version directory under {base_dir} after 100 "
             f"attempts -- too many jobs starting at once?"
         )
+
+    def _axis_search_dir(self, search_name):
+        """Flat outputs/<dataset>-<search_name>, reused across runs."""
+        out_dir = os.path.abspath(
+            os.path.join(
+                get_original_cwd(),
+                "..",
+                "outputs",
+                f"{self._dataset_tag()}-{search_name}",
+            )
+        )
+        os.makedirs(out_dir, exist_ok=True)
+        print(f"Writing {search_name} results to {out_dir}")
+        self._record_hydra_run(out_dir)
+        return out_dir
 
     def _record_hydra_run(self, version_dir):
         try:
@@ -1167,6 +1208,7 @@ class GraphDiscreteFlowModel(pl.LightningModule):
             "random": self.search_random,
             "sobol": self.search_sobol,
             "bo": self.search_bayesian_optimization,
+            "fixed_configs": self.search_fixed_configs,
         }
         if self.cfg.sample.search == "all":
             to_run = ["distortion", "stochasticity", "target_guidance"]
@@ -1200,6 +1242,9 @@ class GraphDiscreteFlowModel(pl.LightningModule):
         # distortion_list = ["identity", "polydec"]
         seed_list = [0, 1, 2]
 
+        out_dir = self._axis_search_dir("distortion")
+        results_path = os.path.join(out_dir, "search_distortion.csv")
+
         for seed in seed_list:
             pl.seed_everything(seed)
 
@@ -1214,7 +1259,7 @@ class GraphDiscreteFlowModel(pl.LightningModule):
                     res_df = self._result_row(res, num_step=num_step, distortor=distortor, seed=seed, time_s=config_time)
                     results_df = pd.concat([results_df, res_df], ignore_index=True)
                     # save at each step as well
-                    results_df.to_csv(f"search_distortion.csv")
+                    results_df.to_csv(results_path)
 
         # set back to default value
         self.cfg.sample.time_distortion = "identity"
@@ -1222,7 +1267,7 @@ class GraphDiscreteFlowModel(pl.LightningModule):
         # save the final results
         results_df.reset_index(drop=True, inplace=True)
         results_df.set_index(["num_step", "distortor", "seed"], inplace=True)
-        results_df.to_csv(f"search_distortion.csv")
+        results_df.to_csv(results_path)
 
     def search_stochasticity(self, num_step_list):
         """
@@ -1230,9 +1275,12 @@ class GraphDiscreteFlowModel(pl.LightningModule):
         The num_step_list is tunable based on requirements.
         """
         results_df = pd.DataFrame()
-        eta_list = [0.0, 5, 10, 25, 50, 100, 200]
+        eta_list = [0.0, 5, 10, 25, 50, 100, 200, 300, 500]
         # eta_list = [5, 10]
         seed_list = [0, 1, 2]
+
+        out_dir = self._axis_search_dir("stochasticity")
+        results_path = os.path.join(out_dir, "search_stochasticity.csv")
 
         for seed in seed_list:
             pl.seed_everything(seed)
@@ -1249,14 +1297,14 @@ class GraphDiscreteFlowModel(pl.LightningModule):
                     res_df = self._result_row(res, num_step=num_step, eta=eta, seed=seed, time_s=config_time)
                     results_df = pd.concat([results_df, res_df], ignore_index=True)
                     # save at each step as well
-                    results_df.to_csv(f"search_stochasticity.csv")
+                    results_df.to_csv(results_path)
 
         self.cfg.sample.eta = 0.0
         self.rate_matrix_designer.eta = 0.0
 
         results_df.reset_index(drop=True, inplace=True)
         results_df.set_index(["num_step", "eta", "seed"], inplace=True)
-        results_df.to_csv(f"search_stochasticity.csv")
+        results_df.to_csv(results_path)
 
     def search_target_guidance(self, num_step_list):
         """
@@ -1279,6 +1327,9 @@ class GraphDiscreteFlowModel(pl.LightningModule):
         ]
         seed_list = [0, 1, 2]
 
+        out_dir = self._axis_search_dir("target_guidance")
+        results_path = os.path.join(out_dir, "search_target_guidance.csv")
+
         for seed in seed_list:
             pl.seed_everything(seed)
 
@@ -1293,14 +1344,14 @@ class GraphDiscreteFlowModel(pl.LightningModule):
                     samples, labels, res, config_time = self._sample_and_evaluate()
                     res_df = self._result_row(res, num_step=num_step, omega=omega, seed=seed, time_s=config_time)
                     results_df = pd.concat([results_df, res_df], ignore_index=True)
-                    results_df.to_csv(f"search_target_guidance.csv")
+                    results_df.to_csv(results_path)
 
         self.cfg.sample.omega = 0.0
         self.rate_matrix_designer.omega = 0.0
 
         results_df.reset_index(drop=True, inplace=True)
         results_df.set_index(["num_step", "omega", "seed"], inplace=True)
-        results_df.to_csv(f"search_target_guidance.csv")
+        results_df.to_csv(results_path)
 
     def search_full_grid(self, num_step_list):
         """
@@ -1310,7 +1361,7 @@ class GraphDiscreteFlowModel(pl.LightningModule):
         eta_list = [0.0, 5, 10, 25, 50, 100]
         omega_list = [0.0, 0.01, 0.02, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5]
 
-        version_dir = self._search_version_dir("full_grid", tags=(self.cfg.dataset.name,))
+        version_dir = self._search_version_dir("full_grid")
         checkpoint_path = os.path.join(version_dir, "results.csv")
         key_cols = ["num_step", "distortor", "eta", "omega"]
         dtypes = {"num_step": int, "distortor": str, "eta": float, "omega": float}
@@ -1350,7 +1401,7 @@ class GraphDiscreteFlowModel(pl.LightningModule):
         n_trials = self.cfg.sample.search_n_trials
 
         version_dir = self._search_version_dir(
-            "random", tags=(self.cfg.dataset.name, f"seed{self.cfg.sample.search_seed}")
+            "random", tags=(f"seed{self.cfg.sample.search_seed}",)
         )
         checkpoint_path = os.path.join(version_dir, "results.csv")
         results_df, completed = self._load_search_checkpoint(
@@ -1414,7 +1465,7 @@ class GraphDiscreteFlowModel(pl.LightningModule):
         }
 
         version_dir = self._search_version_dir(
-            "sobol", tags=(self.cfg.dataset.name, f"seed{self.cfg.sample.search_seed}")
+            "sobol", tags=(f"seed{self.cfg.sample.search_seed}",)
         )
         checkpoint_path = os.path.join(version_dir, "results.csv")
         results_df, completed = self._load_search_checkpoint(
@@ -1507,7 +1558,7 @@ class GraphDiscreteFlowModel(pl.LightningModule):
 
         version_dir = self._search_version_dir(
             "bo",
-            tags=(self.cfg.dataset.name, sampler_name, mode, f"seed{self.cfg.sample.search_seed}"),
+            tags=(sampler_name, mode, f"seed{self.cfg.sample.search_seed}"),
         )
         checkpoint_path = os.path.join(version_dir, "results.csv")
         results_df, completed = self._load_search_checkpoint(
@@ -1591,3 +1642,200 @@ class GraphDiscreteFlowModel(pl.LightningModule):
         self._save_search_checkpoint(results_df, checkpoint_path)
         self._mark_search_done(version_dir)
         print(f"search_bayesian_optimization results checkpointed at {checkpoint_path}")
+
+   
+    FIXED_CONFIG_HEADER = ["method", "objective", "time", "a", "b", "eta", "omega"]
+    FIXED_CONFIG_NUMERIC = {"eta": 0.0, "omega": 0.0, "a": 1.0, "b": 1.0}
+
+    @staticmethod
+    def _read_fixed_configs_csv(csv_path):
+        """Rows are allowed to omit one of the leading descriptive fields (the
+        vanilla row carries no 'objective'), so short rows are padded there
+        instead of at the end where the numbers live."""
+        with open(csv_path, newline="") as f:
+            rows = [
+                [cell.strip() for cell in row]
+                for row in csv.reader(f)
+                if any(cell.strip() for cell in row)
+            ]
+        if not rows:
+            raise ValueError(f"sample.search_configs_csv: '{csv_path}' is empty.")
+
+        header, records = rows[0], []
+        for line_no, row in enumerate(rows[1:], start=2):
+            if len(row) < len(header):
+                print(
+                    f"  [fixed_configs] line {line_no} of {os.path.basename(csv_path)} has "
+                    f"{len(row)} of {len(header)} fields, padding after '{header[0]}'"
+                )
+                row = row[:1] + [""] * (len(header) - len(row)) + row[1:]
+            records.append(dict(zip(header, row[: len(header)])))
+        return header, records
+
+    def _load_fixed_configs(self):
+        """The (distortor, a, b, eta, omega) list search 'fixed_configs' evaluates,
+        read from sample.search_configs_csv."""
+        csv_path = self.cfg.sample.search_configs_csv
+        if csv_path is None:
+            raise ValueError(
+                "search: 'fixed_configs' needs sample.search_configs_csv to point at a "
+                f"CSV with columns {self.FIXED_CONFIG_HEADER}."
+            )
+        csv_path = os.path.abspath(
+            os.path.join(get_original_cwd(), os.path.expanduser(str(csv_path)))
+        )
+        if not os.path.exists(csv_path):
+            raise FileNotFoundError(f"sample.search_configs_csv: no such file '{csv_path}'.")
+
+        header, records = self._read_fixed_configs_csv(csv_path)
+        if not records:
+            raise ValueError(
+                f"sample.search_configs_csv: '{csv_path}' holds a header but no config rows."
+            )
+        missing = [col for col in self.FIXED_CONFIG_HEADER if col not in header]
+        if missing:
+            raise KeyError(
+                f"sample.search_configs_csv: '{csv_path}' is missing column(s) {missing}; "
+                f"expected {self.FIXED_CONFIG_HEADER}, found {header}."
+            )
+
+        configs = []
+        for rec in records:
+            config = {"distortor": rec["time"]}
+            for col, default in self.FIXED_CONFIG_NUMERIC.items():
+                config[col] = float(rec[col]) if rec[col] != "" else default
+            # every CSV column, in its original order, so the descriptive fields
+            # (method, objective) reach the outputs
+            config["row"] = dict(
+                rec, **{col: config[col] for col in self.FIXED_CONFIG_NUMERIC}
+            )
+            configs.append(config)
+        return configs, csv_path, header
+
+    def _check_fixed_configs_snapshot(self, version_dir, csv_path):
+        """The checkpoint keys its rows by config_idx, so a resumed run has to be
+        reading the same config list: snapshot it the first time, compare after."""
+        snapshot_path = os.path.join(version_dir, "configs.csv")
+        with open(csv_path, newline="") as f:
+            content = f.read()
+        if not os.path.exists(snapshot_path):
+            with open(snapshot_path, "w", newline="") as f:
+                f.write(content)
+            return
+        with open(snapshot_path, newline="") as f:
+            if f.read() != content:
+                raise RuntimeError(
+                    f"'{version_dir}' holds an unfinished 'fixed_configs' search over a "
+                    f"different config list than '{csv_path}' (snapshot: {snapshot_path}). "
+                    f"Its rows are keyed by config_idx, so resuming would mix the two. "
+                    f"Mark that directory DONE (or delete it) to start a new version."
+                )
+
+    def _save_fixed_configs_seed_stats(self, results_df, configs_df, csv_header, stats_path):
+        """mean/sd over the seeds, per config and num_step, with the source CSV's
+        columns describing each config prepended."""
+        # a molecular dataset has no ratio metric, so aggregate whichever of the
+        # two objectives was actually evaluated
+        aggs = {}
+        for col, _ in zip(*objective_spec("both", self.cfg.dataset.directed)):
+            if col in results_df.columns:
+                name = col.split("/")[-1].removesuffix("_mean")
+                aggs[f"{name}_mean"] = (col, "mean")
+                aggs[f"{name}_sd"] = (col, "std")
+        if not aggs:
+            return
+        seed_stats = results_df.groupby(["config_idx", "num_step"]).agg(**aggs).reset_index()
+        seed_stats = configs_df.merge(seed_stats, on="config_idx")
+        seed_stats = seed_stats[csv_header + ["config_idx", "num_step"] + list(aggs)]
+        seed_stats.to_csv(stats_path, index=False)
+
+    def search_fixed_configs(self, _num_step_list=None):
+        """
+        Evaluate a fixed list of sampling configs read from a CSV, checkpointed
+        after every run. The step counts and seeds are fixed here rather than
+        taken from search_hyperparameters, so a config list is always evaluated
+        on the same grid.
+        """
+        num_step_list = [5, 10, 25, 50, 100, 250, 500, 1000]  # was [5, 10, 25, 50, 100, 250, 500, 1000]
+        seed_list = [0, 1, 2]
+        configs, csv_path, csv_header = self._load_fixed_configs()
+
+        version_dir = self._search_version_dir("fixed_configs")
+        self._check_fixed_configs_snapshot(version_dir, csv_path)
+        checkpoint_path = os.path.join(version_dir, "results.csv")
+        stats_path = os.path.join(version_dir, "seed_stats.csv")
+        key_cols = ["config_idx", "num_step", "seed"]
+        dtypes = {"config_idx": int, "num_step": int, "seed": int}
+        results_df, completed = self._load_search_checkpoint(checkpoint_path, key_cols, dtypes)
+
+        # one row per config, holding every column of the source CSV, to be joined
+        # back onto the per-config aggregates
+        configs_df = pd.DataFrame(
+            [dict(config["row"], config_idx=idx) for idx, config in enumerate(configs)]
+        )
+        # the fields that describe a config rather than define it (method, objective)
+        descriptive = [c for c in csv_header if c not in ("time", *self.FIXED_CONFIG_NUMERIC)]
+
+        grid = itertools.product(range(len(configs)), num_step_list, seed_list)
+        todo = [c for c in grid if (int(c[0]), int(c[1]), int(c[2])) not in completed]
+        print(
+            f"Evaluating {len(configs)} fixed config(s) at num_steps {list(num_step_list)}, "
+            f"seeds {seed_list} from {csv_path}"
+        )
+
+        search_start = time.time()
+        for run_idx, (config_idx, num_step, seed) in enumerate(todo, 1):
+            config = configs[config_idx]
+            pl.seed_everything(seed)
+            self._apply_sampling_config(
+                num_step,
+                config["distortor"],
+                config["eta"],
+                config["omega"],
+                config["a"],
+                config["b"],
+            )
+            label = "/".join(str(config["row"][c]) for c in descriptive)
+            print(
+                f"############# [{run_idx}/{len(todo)}] Fixed config {config_idx} ({label}): "
+                f"num_steps: {num_step}, distortor: {config['distortor']}, "
+                f"eta: {config['eta']:.4f}, omega: {config['omega']:.4f}, "
+                f"a: {config['a']:.4f}, b: {config['b']:.4f}, seed: {seed} #############"
+            )
+            samples, labels, res, config_time = self._sample_and_evaluate()
+            self._print_progress(config_time, run_idx, len(todo), search_start)
+            res_df = self._result_row(
+                res,
+                config_idx=config_idx,
+                num_step=num_step,
+                seed=seed,
+                distortor=config["distortor"],
+                eta=config["eta"],
+                omega=config["omega"],
+                distortion_a=config["a"],
+                distortion_b=config["b"],
+                time_s=config_time,
+                **{c: config["row"][c] for c in descriptive},
+            )
+            results_df = pd.concat([results_df, res_df], ignore_index=True)
+            self._save_search_checkpoint(results_df, checkpoint_path)
+            self._save_fixed_configs_seed_stats(results_df, configs_df, csv_header, stats_path)
+
+        self._reset_sampling_config()
+
+        self._search_summary_info += [
+            f"configs_csv: {csv_path}",
+            f"n_configs: {len(configs)}",
+            f"num_steps: {list(num_step_list)}",
+            f"seeds: {seed_list}",
+        ]
+
+        self._save_fixed_configs_seed_stats(results_df, configs_df, csv_header, stats_path)
+        results_df.reset_index(drop=True, inplace=True)
+        results_df.set_index(key_cols, inplace=True)
+        self._save_search_checkpoint(results_df, checkpoint_path)
+        self._mark_search_done(version_dir)
+        print(
+            f"search_fixed_configs results checkpointed at {checkpoint_path} "
+            f"(per-seed aggregates at {stats_path})"
+        )
