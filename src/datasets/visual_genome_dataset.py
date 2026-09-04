@@ -27,7 +27,8 @@ class VisualGenomeDataset(InMemoryDataset):
         self.cfg = cfg
         self.split = split
         super().__init__(root, transform, pre_transform, pre_filter)
-        self.data, self.slices = torch.load(self.processed_paths[0])
+        split_idx = self.processed_file_names.index(f"{self.split}.pt")
+        self.data, self.slices = torch.load(self.processed_paths[split_idx])
 
     @property
     def raw_file_names(self):
@@ -42,7 +43,9 @@ class VisualGenomeDataset(InMemoryDataset):
 
     @property
     def processed_file_names(self):
-        return [f"{self.split}.pt"]
+        # process() builds all three splits in one pass, since the random split is
+        # drawn over the whole filtered set, so every split file is declared here.
+        return ["train.pt", "val.pt", "test.pt"]
 
     def download(self):
         """
