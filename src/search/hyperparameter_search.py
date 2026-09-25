@@ -368,7 +368,12 @@ class HyperparameterSearchMixin(SearchUtilsMixin):
 
         version_dir = self._search_version_dir(
             "bo",
-            tags=(sampler_name, mode, f"seed{self.cfg.sample.search_seed}"),
+            tags=(
+                sampler_name,
+                mode,
+                self.cfg.sample.search_objective,
+                f"seed{self.cfg.sample.search_seed}",
+            ),
         )
         checkpoint_path = os.path.join(version_dir, "results.csv")
         results_df, completed = self._load_search_checkpoint(
@@ -388,7 +393,10 @@ class HyperparameterSearchMixin(SearchUtilsMixin):
         for num_step in num_step_list:
             study = optuna.create_study(
                 sampler=self._make_bo_sampler(
-                    sampler_name, self.cfg.sample.search_bo_n_startup_trials
+                    sampler_name,
+                    self.cfg.sample.search_bo_n_startup_trials,
+                    search_space=search_space,
+                    num_obj=len(objective_cols),
                 ),
                 **({"direction": directions[0]} if len(directions) == 1 else {"directions": directions}),
             )

@@ -266,9 +266,11 @@ class GraphDiscreteFlowModel(HyperparameterSearchMixin, pl.LightningModule):
             self.search_hyperparameters()
         else:
             print("Starting to sample")
+            start = time.perf_counter()
             samples, labels = self.sample(
                 is_test=True, save_samples=self.cfg.general.save_samples, save_visualization=self.cfg.general.save_visualization
             )
+            print(f"[timing] generation: {time.perf_counter() - start:.2f}s for {len(samples)} graphs")
             to_log = self.evaluate_samples(samples=samples, labels=labels, is_test=True)
 
             # Store results
@@ -427,6 +429,7 @@ class GraphDiscreteFlowModel(HyperparameterSearchMixin, pl.LightningModule):
                 cur_samples = [samples[j] for j in idx]
                 cur_labels = [labels[j] for j in idx]
 
+                start = time.perf_counter()
                 cur_to_log = self.sampling_metrics.forward(
                     cur_samples,
                     ref_metrics=self.dataset_info.ref_metrics,
@@ -436,6 +439,7 @@ class GraphDiscreteFlowModel(HyperparameterSearchMixin, pl.LightningModule):
                     test=is_test,
                     local_rank=self.local_rank,
                 )
+                print(f"[timing] eval fold {i}: {time.perf_counter() - start:.2f}s for {len(cur_samples)} graphs")
 
                 if i == 0:
                     to_log = {i: [cur_to_log[i]] for i in cur_to_log}
