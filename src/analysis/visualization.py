@@ -296,8 +296,8 @@ class SceneGraphVisualization:
             file_path = os.path.join(path, "graph_{}.png".format(i)) if log is not "chain" else path
             graph = self.to_networkx(graphs[i][0].numpy(), graphs[i][1].numpy())
 
-            if pos is None:
-                pos = nx.spring_layout(graph, seed=42, k=2)
+            # Recompute the layout per graph (graphs differ in size).
+            graph_pos = nx.spring_layout(graph, seed=42, k=2) if pos is None else pos
 
             labels = nx.get_node_attributes(graph, "symbol")
             labels = {k: int(v) for k, v in labels.items()}  # convert to int
@@ -337,9 +337,9 @@ class SceneGraphVisualization:
             # Draw graph
             # nx.draw(G, pos, with_labels=True, labels=labels, node_color=node_colors)
             plt.figure(figsize=(14, 12))
-            nx.draw_networkx_nodes(graph, pos, node_color=node_colors, node_size=2000, node_shape='s')
-            nx.draw_networkx_edges(graph, pos, width=2.0, edge_color='gray', arrows=True, arrowsize=60)
-            nx.draw_networkx_labels(graph, pos, labels=text_labels, font_size=12, font_color='black', verticalalignment='center', horizontalalignment='center')
+            nx.draw_networkx_nodes(graph, graph_pos, node_color=node_colors, node_size=2000, node_shape='s')
+            nx.draw_networkx_edges(graph, graph_pos, width=2.0, edge_color='gray', arrows=True, arrowsize=60)
+            nx.draw_networkx_labels(graph, graph_pos, labels=text_labels, font_size=12, font_color='black', verticalalignment='center', horizontalalignment='center')
 
             # Add legend
             if add_legend:
@@ -438,6 +438,7 @@ class DAGVisualization:
             file_path = os.path.join(path, "graph_{}.png".format(i)) if log is not "chain" else path
             graph = self.to_networkx(graphs[i][0].numpy(), graphs[i][1].numpy())
 
+            # Recompute the layout per graph (graphs differ in size).
             if pos is None:
                 if nx.is_directed_acyclic_graph(graph):
                     for layer, nodes in enumerate(nx.topological_generations(graph)):
@@ -447,17 +448,19 @@ class DAGVisualization:
                             graph.nodes[node]["layer"] = layer
 
                     # Compute the multipartite_layout using the "layer" node attribute
-                    pos = nx.multipartite_layout(graph, subset_key="layer")
+                    graph_pos = nx.multipartite_layout(graph, subset_key="layer")
                 else:
-                    pos = nx.spring_layout(graph, iterations=100)
-            
+                    graph_pos = nx.spring_layout(graph, iterations=100)
+            else:
+                graph_pos = pos
+
             labels = nx.get_node_attributes(graph, "symbol")
             labels = {k: int(v) for k, v in labels.items()}
 
             plt.figure()
             nx.draw(
                 graph,
-                pos,
+                graph_pos,
                 font_size=12,
                 node_size=400,
                 with_labels=self.label,
@@ -555,8 +558,8 @@ class DirectedVisualization:
             file_path = os.path.join(path, "graph_{}.png".format(i)) if log is not "chain" else path
             graph = self.to_networkx(graphs[i][0].numpy(), graphs[i][1].numpy())
             
-            if pos is None:
-                pos = nx.spring_layout(graph) 
+            # Recompute the layout per graph (graphs differ in size).
+            graph_pos = nx.spring_layout(graph) if pos is None else pos
 
             # Set node colors based on the eigenvectors
             # Compute directed Laplacian matrix (as a NumPy array)
@@ -572,7 +575,7 @@ class DirectedVisualization:
             plt.figure()
             nx.draw(
                 graph,
-                pos,
+                graph_pos,
                 font_size=5,
                 node_size=150,
                 with_labels=False,
