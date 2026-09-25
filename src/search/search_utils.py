@@ -249,7 +249,7 @@ class SearchUtilsMixin:
             )
         return len(prior)
 
-    def _make_bo_sampler(self, sampler_name, n_startup_trials):
+    def _make_bo_sampler(self, sampler_name, n_startup_trials, search_space=None, num_obj=1):
         import optuna
 
         seed = self.cfg.sample.search_seed
@@ -257,7 +257,22 @@ class SearchUtilsMixin:
             return optuna.samplers.TPESampler(seed=seed, n_startup_trials=n_startup_trials)
         if sampler_name == "gp":
             return optuna.samplers.GPSampler(seed=seed, n_startup_trials=n_startup_trials)
-        raise ValueError(f"Unknown search_bo_sampler '{sampler_name}'. Choose 'tpe' or 'gp'.")
+        if sampler_name == "hebo":
+            try:
+                import hebo  # noqa: F401
+                import optunahub
+            except ImportError as e:
+                raise ImportError(
+                    "search_bo_sampler='hebo' needs 'hebo' and 'optunahub'; "
+                    "use the environment_hebo.yaml env."
+                ) from e
+            hebo_module = optunahub.load_module("samplers/hebo")
+            return hebo_module.HEBOSampler(
+                search_space=search_space, seed=seed, num_obj=num_obj
+            )
+        raise ValueError(
+            f"Unknown search_bo_sampler '{sampler_name}'. Choose 'tpe', 'gp' or 'hebo'."
+        )
 
     def _bo_distortion_space(self, mode):
         """The distortion dimension(s) of the BO search space."""
