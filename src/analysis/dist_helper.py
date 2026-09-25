@@ -4,8 +4,10 @@
 #
 ###############################################################################
 # import pyemd
+import hashlib
 import numpy as np
 import concurrent.futures
+from collections import OrderedDict
 from functools import partial
 from scipy.linalg import toeplitz
 from tqdm import tqdm
@@ -105,6 +107,57 @@ def disc(samples1, samples2, kernel, is_parallel=True, *args, **kwargs):
     return d
 
 
+# Cache for the MMD reference self-term, which is constant across search trials.
+_SELF_DISC_CACHE = OrderedDict()
+_SELF_DISC_CACHE_MAXSIZE = 64
+_SELF_DISC_CACHE_ENABLED = False
+_SELF_DISC_CACHE_MIN_SAMPLES = 64
+
+
+def enable_self_disc_cache(enabled=True):
+    global _SELF_DISC_CACHE_ENABLED
+    _SELF_DISC_CACHE_ENABLED = enabled
+    _SELF_DISC_CACHE.clear()
+
+
+def clear_self_disc_cache():
+    _SELF_DISC_CACHE.clear()
+
+
+def _samples_digest(samples):
+    h = hashlib.blake2b(digest_size=16)
+    h.update(str(len(samples)).encode())
+    for s in samples:
+        a = np.ascontiguousarray(s)
+        h.update(str(a.shape).encode())
+        h.update(str(a.dtype).encode())
+        h.update(a.tobytes())
+    return h.digest()
+
+
+def self_disc(samples, kernel, *args, **kwargs):
+    """disc(samples, samples), memoized on the content of ``samples``."""
+    if not _SELF_DISC_CACHE_ENABLED or len(samples) < _SELF_DISC_CACHE_MIN_SAMPLES:
+        return disc(samples, samples, kernel, *args, **kwargs)
+
+    key = (
+        getattr(kernel, "__module__", None),
+        getattr(kernel, "__qualname__", repr(kernel)),
+        args,
+        tuple(sorted(kwargs.items())),
+        _samples_digest(samples),
+    )
+    if key in _SELF_DISC_CACHE:
+        _SELF_DISC_CACHE.move_to_end(key)
+        return _SELF_DISC_CACHE[key]
+
+    value = disc(samples, samples, kernel, *args, **kwargs)
+    _SELF_DISC_CACHE[key] = value
+    if len(_SELF_DISC_CACHE) > _SELF_DISC_CACHE_MAXSIZE:
+        _SELF_DISC_CACHE.popitem(last=False)
+    return value
+
+
 def compute_mmd(samples1, samples2, kernel, is_hist=True, *args, **kwargs):
     """MMD between two samples"""
     # normalize histograms into pmf
@@ -112,8 +165,8 @@ def compute_mmd(samples1, samples2, kernel, is_hist=True, *args, **kwargs):
         samples1 = [s1 / (np.sum(s1) + 1e-6) for s1 in samples1]
         samples2 = [s2 / (np.sum(s2) + 1e-6) for s2 in samples2]
     return (
-        disc(samples1, samples1, kernel, *args, **kwargs)
-        + disc(samples2, samples2, kernel, *args, **kwargs)
+        self_disc(samples1, kernel, *args, **kwargs)
+        + self_disc(samples2, kernel, *args, **kwargs)
         - 2 * disc(samples1, samples2, kernel, *args, **kwargs)
     )
 

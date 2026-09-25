@@ -14,6 +14,7 @@ from scipy.linalg import eigvalsh
 from scipy.stats import chi2, ks_2samp, powerlaw
 from src.analysis.dist_helper import (
     compute_mmd,
+    enable_self_disc_cache,
     gaussian_emd,
     gaussian_tv,
 )
@@ -28,6 +29,7 @@ from torch_geometric.utils import to_networkx
 import wandb
 import time
 import multiprocessing
+import os
 import queue
 import threading
 
@@ -687,11 +689,27 @@ def _is_sbm_graph_wrapper(G_data, params, result_queue):
         result_queue.put(e)
 
 
+def _sbm_process_context():
+    """Forkserver context, so each SBM child skips re-importing torch etc."""
+    global _SBM_CONTEXT
+    if _SBM_CONTEXT is None:
+        try:
+            ctx = multiprocessing.get_context("forkserver")
+            ctx.set_forkserver_preload(["src.analysis.directed_utils"])
+        except ValueError:
+            ctx = multiprocessing.get_context("spawn")
+        _SBM_CONTEXT = ctx
+    return _SBM_CONTEXT
+
+
+_SBM_CONTEXT = None
+
+
 def safe_is_sbm_graph(G, p_intra=0.3, p_inter=0.005, strict=True, refinement_steps=100, timeout=180):
     """Run is_sbm_graph in an isolated process with crash/timeout protection.
     """
     adj = nx.adjacency_matrix(G).toarray()
-    ctx = multiprocessing.get_context("spawn")
+    ctx = _sbm_process_context()
     result_queue = ctx.Queue()
     params = (p_intra, p_inter, strict, refinement_steps)
     process = ctx.Process(
@@ -731,7 +749,7 @@ def eval_acc_sbm_graph(
 ):
     count = 0.0
     if is_parallel:
-        max_workers = min(4, max(1, len(G_list)))
+        max_workers = min(len(os.sched_getaffinity(0)), max(1, len(G_list)))
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             for prob in executor.map(
                 safe_is_sbm_graph,
@@ -1530,6 +1548,8 @@ class TPUSamplingMetrics(DirectedSamplingMetrics):
             compute_emd=False,
         )
         self.num_node_classes = datamodule.cfg.dataset.num_node_classes
+        # Large test set: cache the constant MMD reference self-term.
+        enable_self_disc_cache(True)
 
     # Override loader so that the node labels are kept
     def loader_to_nx(self, loader, directed=False):
