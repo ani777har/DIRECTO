@@ -4,3 +4,6 @@ datadir: 'data/tpu_tile/'
 directed: True
 graph_type: 'tpu_tile'
 acyclic: True
+
+# node-label vocabulary; must match the one-hot width built in tpu_tile_dataset.py
+num_node_classes: 47

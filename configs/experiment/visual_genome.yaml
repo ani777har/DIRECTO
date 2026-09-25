@@ -11,7 +11,7 @@ general:
     chains_to_save: 1
     log_every_steps: 50
     number_chain_steps: 50        # Number of frames in each gif
-    final_model_samples_to_generate: 63
+    final_model_samples_to_generate: 78 #63 Anishok for bootstrapping
     final_model_chains_to_save: 10
 
 train:
